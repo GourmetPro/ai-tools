@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/bump-homebrew-release (--version VERSION | --major | --minor | --patch) [--commitish COMMITISH]
+
+Create or reuse tag VERSION and update Formula/*.rb to that tag and commit.
+
+Examples:
+  scripts/bump-homebrew-release --patch
+  scripts/bump-homebrew-release --minor
+  scripts/bump-homebrew-release --major
+  scripts/bump-homebrew-release --version 0.2.0
+  scripts/bump-homebrew-release --version v0.2.0 --commitish HEAD
+EOF
+}
+
+die() {
+  printf 'bump-homebrew-release: %s\n' "$1" >&2
+  exit 2
+}
+
+raw_version=""
+bump_level=""
+commitish="HEAD"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --version)
+      [[ $# -ge 2 ]] || die "--version requires a value"
+      raw_version="$2"
+      shift 2
+      ;;
+    --version=*)
+      raw_version="${1#--version=}"
+      shift
+      ;;
+    --major|--minor|--patch)
+      if [[ -n "$bump_level" ]]; then
+        die "choose only one bump level"
+      fi
+      bump_level="${1#--}"
+      shift
+      ;;
+    --commitish)
+      [[ $# -ge 2 ]] || die "--commitish requires a value"
+      commitish="$2"
+      shift 2
+      ;;
+    --commitish=*)
+      commitish="${1#--commitish=}"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown argument: $1"
+      ;;
+  esac
+done
+
+if [[ -n "$raw_version" && -n "$bump_level" ]]; then
+  die "use either --version or a bump level, not both"
+fi
+if [[ -z "$raw_version" && -z "$bump_level" ]]; then
+  die "choose --version, --major, --minor, or --patch"
+fi
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not inside a Git repository"
+cd "$repo_root"
+
+revision="$(git rev-parse "${commitish}^{commit}" 2>/dev/null)" || die "unknown commitish: $commitish"
+
+current_version="$(sed -nE 's/^[[:space:]]*version "([0-9]+[.][0-9]+[.][0-9]+)".*/\1/p' Formula/wt.rb | head -n 1)"
+[[ -n "$current_version" ]] || die "could not read current version from Formula/wt.rb"
+
+if [[ -n "$raw_version" ]]; then
+  version="${raw_version#v}"
+else
+  IFS=. read -r major minor patch <<< "$current_version"
+  case "$bump_level" in
+    major)
+      major=$((major + 1))
+      minor=0
+      patch=0
+      ;;
+    minor)
+      minor=$((minor + 1))
+      patch=0
+      ;;
+    patch)
+      patch=$((patch + 1))
+      ;;
+  esac
+  version="$major.$minor.$patch"
+fi
+
+if [[ ! "$version" =~ ^[0-9]+[.][0-9]+[.][0-9]+$ ]]; then
+  die "VERSION must look like 1.2.3 or v1.2.3"
+fi
+tag="v$version"
+
+if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+  existing_revision="$(git rev-parse "$tag^{commit}")"
+  if [[ "$existing_revision" != "$revision" ]]; then
+    die "$tag already points at $existing_revision, not $revision"
+  fi
+else
+  git tag "$tag" "$revision"
+fi
+
+formulae=(Formula/wt.rb Formula/backlog.rb)
+for formula in "${formulae[@]}"; do
+  [[ -f "$formula" ]] || die "missing formula: $formula"
+done
+
+AI_TOOLS_TAG="$tag" AI_TOOLS_VERSION="$version" AI_TOOLS_REVISION="$revision" \
+  perl -0pi -e '
+    s/tag:\s+"v[0-9]+[.][0-9]+[.][0-9]+",\n\s+revision:\s+"[0-9a-f]{40}"/tag:      "$ENV{AI_TOOLS_TAG}",\n      revision: "$ENV{AI_TOOLS_REVISION}"/g;
+    s/version "[^"]+"/version "$ENV{AI_TOOLS_VERSION}"/g;
+  ' "${formulae[@]}"
+
+for formula in "${formulae[@]}"; do
+  ruby -c "$formula" >/dev/null
+done
+
+printf 'Updated Homebrew formulae to %s\n' "$tag"
+printf 'Revision: %s\n' "$revision"
+printf 'Files:\n'
+printf '  %s\n' "${formulae[@]}"
