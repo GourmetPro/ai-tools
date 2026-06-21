@@ -46,14 +46,25 @@ Install each tool independently:
 
 ```sh
 ./install/wt
-./install/backlog --database-url 'postgres://user:pass@host/db'
+./install/backlog
 ```
 
 Both installers symlink into `$AI_TOOLS_BIN_DIR` or `~/.local/bin` by default.
 Use `--bin-dir /some/path` to install somewhere else.
 
-`backlog` writes its config to `$BACKLOG_CONFIG`, `$XDG_CONFIG_HOME/ai-tools/backlog.conf`,
-or `~/.config/ai-tools/backlog.conf`. Edit that file later to change the database URL.
+`install/backlog` prompts for `DATABASE_URL` when it creates a new config. Press
+Enter to skip; it will still create a template with `DATABASE_URL=` and the
+example `postgres://user:pass@host/db` as a comment. You can also pass the value
+directly:
+
+```sh
+./install/backlog --database-url 'postgres://user:pass@host/db'
+```
+
+`backlog` writes its config to `$BACKLOG_CONFIG`,
+`$XDG_CONFIG_HOME/ai-tools/backlog.conf`, or
+`~/.config/ai-tools/backlog.conf`. Edit that file later to change the database
+URL.
 
 ## Development
 

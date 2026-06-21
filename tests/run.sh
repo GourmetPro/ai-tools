@@ -146,6 +146,23 @@ test_backlog_installs_separately_and_writes_config() {
   assert_contains "DATABASE_URL='postgres://install.example/backlog'" "$tmp/config/backlog.conf" "installer database config" || return 1
 }
 
+test_backlog_installer_creates_blank_config_template() {
+  local tmp="$1"
+  "$ROOT/install/backlog" \
+    --bin-dir "$tmp/bin" \
+    --config "$tmp/config/backlog.conf" > "$tmp/out" 2> "$tmp/err" || {
+      fail "install/backlog should create a blank config without --database-url; stderr was: $(<"$tmp/err")"
+      return 1
+    }
+
+  [[ -L "$tmp/bin/backlog" ]] || {
+    fail "install/backlog should create a backlog symlink"
+    return 1
+  }
+  assert_contains "# postgres://user:pass@host/db" "$tmp/config/backlog.conf" "blank config example comment" || return 1
+  assert_contains "DATABASE_URL=" "$tmp/config/backlog.conf" "blank config database key" || return 1
+}
+
 test_homebrew_wt_formula() {
   local formula="$ROOT/Formula/wt.rb"
   assert_file_exists "$formula" "wt Homebrew formula" || return 1
@@ -259,6 +276,7 @@ run_test "backlog reads DATABASE_URL from editable config" with_tmpdir test_back
 run_test "backlog explains missing config" with_tmpdir test_backlog_explains_missing_config
 run_test "wt has its own installer" with_tmpdir test_wt_installs_separately
 run_test "backlog has its own installer and config setup" with_tmpdir test_backlog_installs_separately_and_writes_config
+run_test "backlog installer creates skippable blank config template" with_tmpdir test_backlog_installer_creates_blank_config_template
 run_test "wt has a Homebrew formula" test_homebrew_wt_formula
 run_test "backlog has a Homebrew formula" test_homebrew_backlog_formula
 run_test "release helper bumps Homebrew formulae and tag" with_tmpdir test_bump_homebrew_release_script_updates_formulae_and_tag
