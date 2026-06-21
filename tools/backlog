@@ -72,16 +72,19 @@ function loadConfigFile(file) {
   return out;
 }
 
-const CONFIG_PATH = process.env.BACKLOG_CONFIG || defaultConfigPath();
-const CONFIG = loadConfigFile(CONFIG_PATH);
-const DB_URL = process.env.BACKLOG_DATABASE_URL || CONFIG.DATABASE_URL;
-if (!DB_URL) {
-  fail(`DATABASE_URL is not configured. Edit ${CONFIG_PATH} or run install/backlog --database-url '<postgres-url>'.`);
+function loadDatabaseUrl() {
+  const configPath = process.env.BACKLOG_CONFIG || defaultConfigPath();
+  const config = loadConfigFile(configPath);
+  const dbUrl = process.env.BACKLOG_DATABASE_URL || config.DATABASE_URL;
+  if (!dbUrl) {
+    fail(`DATABASE_URL is not configured. Edit ${configPath} or run install/backlog --database-url '<postgres-url>'.`);
+  }
+  return dbUrl;
 }
 
 // --- psql helpers --------------------------------------------------------------
 function runSql(sql) {
-  const res = spawnSync('psql', [DB_URL, '-X', '-q', '-At', '-v', 'ON_ERROR_STOP=1', '-c', sql], {
+  const res = spawnSync('psql', [loadDatabaseUrl(), '-X', '-q', '-At', '-v', 'ON_ERROR_STOP=1', '-c', sql], {
     encoding: 'utf8',
     maxBuffer: 64 * 1024 * 1024,
   });
@@ -424,9 +427,267 @@ const commands = {
   'create-item': { fn: cmdCreateItem, flags: ['repo', 'workstream', 'title', 'type', 'body', 'priority', 'source-context', 'depends-on', 'branch', 'progress-note', 'due-date', 'links', 'id'] },
   'update-item': { fn: cmdUpdateItem, flags: ['id', 'status', 'priority', 'title', 'body', 'blocked-reason', 'abandoned-reason', 'depends-on', 'branch', 'progress-note', 'due-date', 'links'] },
 };
+
+const commandDocs = {
+  'list-repos': `
+Usage: backlog list-repos
+
+Purpose:
+  Shows repositories registered for backlog item ownership. Run this first when
+  you do not know the exact --repo slug or short slug used in item IDs.
+
+Flags:
+  none
+
+Output:
+  JSON array of backlog_repos rows, ordered by slug.
+
+Examples:
+  backlog list-repos
+`,
+  'create-repo': `
+Usage: backlog create-repo --slug <org/repo> --short-slug <short> --display-name <name> [--default-branch <branch>] [--color <#RRGGBB>]
+
+Purpose:
+  Registers a GitHub repository so backlog items can be assigned to it.
+
+Flags:
+  --slug <org/repo>            Full GitHub repository slug, for example GourmetPro/ai-tools.
+  --short-slug <short>         Lowercase kebab slug used as the first segment in item IDs.
+  --display-name <name>        Human-readable repository name.
+  --default-branch <branch>    Optional default branch. Defaults to main.
+  --color <#RRGGBB>            Optional repository color. If omitted, backlog picks an unused palette color.
+
+Output:
+  JSON object for the created backlog_repos row.
+
+Examples:
+  backlog create-repo --slug GourmetPro/ai-tools --short-slug ai-tools --display-name "ai-tools"
+  backlog create-repo --slug GourmetPro/app --short-slug app --display-name "Console" --default-branch main --color '#1A4D4A'
+`,
+  'list-items': `
+Usage: backlog list-items [--repo <org/repo>] [--workstream <name>] [--status <queued,in_progress,blocked,done,abandoned>] [--type <type>] [--priority <p0|p1|p2|p3>] [--q <text>] [--limit <n>] [--offset <n>]
+
+Purpose:
+  Finds backlog items by repository, workstream, state, type, priority, or text.
+  Use it before creating duplicate work and before updating an item.
+
+Flags:
+  --repo <org/repo>       Filter to one registered GitHub repository.
+  --workstream <name>     Filter to one workstream.
+  --status <csv>          Comma-separated statuses: queued,in_progress,blocked,done,abandoned.
+  --type <type>           engineering, spec_pending_impl, or wiki_ops.
+  --priority <priority>   p0, p1, p2, or p3.
+  --q <text>              Literal case-insensitive search over title and body.
+  --limit <n>             Non-negative integer, capped at 500. Defaults to 50.
+  --offset <n>            Non-negative integer for pagination. Defaults to 0.
+
+Output:
+  JSON array of backlog_items rows. Each item includes console_url.
+
+Examples:
+  backlog list-items --repo GourmetPro/ai-tools --status queued,in_progress
+  backlog list-items --workstream tooling --priority p1 --q "help"
+  backlog list-items --type engineering --limit 100
+`,
+  'get-item': `
+Usage: backlog get-item --id <item-id>
+
+Purpose:
+  Reads one backlog item by ID when you need the full record before acting.
+
+Flags:
+  --id <item-id>    Backlog item ID in <short-slug>--<workstream>--<kebab-title> form.
+
+Output:
+  JSON object for the backlog item, including console_url. Includes a blocks array
+  listing items that depend on this one.
+
+Examples:
+  backlog get-item --id ai-tools--tooling--document-backlog-cli
+`,
+  'summarize': `
+Usage: backlog summarize [--workstream <name>] [--repo <org/repo>]
+
+Purpose:
+  Counts backlog items by workstream and status. Use it for a quick state summary
+  before planning or choosing the next item.
+
+Flags:
+  --workstream <name>    Optional workstream filter.
+  --repo <org/repo>      Optional repository filter.
+
+Output:
+  JSON array with workstream, status, and count fields.
+
+Examples:
+  backlog summarize
+  backlog summarize --repo GourmetPro/ai-tools
+  backlog summarize --workstream tooling
+`,
+  'create-item': `
+Usage: backlog create-item --repo <org/repo> --workstream <name> --title <text> --type engineering|spec_pending_impl|wiki_ops [--body <text>] [--priority p0|p1|p2|p3] [--source-context <text>] [--depends-on <id1,id2>] [--branch <branch>] [--progress-note <text>] [--due-date <YYYY-MM-DD>] [--links '<json array>'] [--id <item-id>]
+
+Purpose:
+  Creates a backlog item for work that should be tracked outside the current chat.
+  For AI agents, create items for durable follow-up tasks, blocked work, or work
+  discovered while operating in a repo.
+
+Flags:
+  --repo <org/repo>           Registered GitHub repository slug. Use backlog list-repos first if unsure.
+  --workstream <name>         Workstream name, max 64 chars.
+  --title <text>              Item title, max 200 chars.
+  --type <type>               engineering, spec_pending_impl, or wiki_ops.
+  --body <text>               Optional detailed description.
+  --priority <priority>       p0, p1, p2, or p3. Defaults to p2.
+  --source-context <text>     Optional note about where this came from, such as a repo path, user request, or meeting.
+  --depends-on <id1,id2>      Optional comma-separated dependency item IDs.
+  --branch <branch>           Optional working branch.
+  --progress-note <text>      Optional progress or recovery note.
+  --due-date <YYYY-MM-DD>     Optional due date.
+  --links '<json array>'      Optional JSON array of related spec, brief, PR, commit, or URL links.
+  --id <item-id>              Optional explicit ID. Otherwise derived from repo short slug, workstream, and title.
+
+Output:
+  JSON object for the created backlog item, including console_url.
+
+Examples:
+  backlog create-item --repo GourmetPro/ai-tools --workstream tooling --title "Document backlog CLI help" --type engineering --priority p2 --source-context "tools/backlog"
+  backlog create-item --repo GourmetPro/app --workstream onboarding --title "Implement approved spec" --type spec_pending_impl --links '[{"kind":"spec","repo":"GourmetPro/app","path":"docs/spec.md"}]'
+`,
+  'update-item': `
+Usage: backlog update-item --id <item-id> [--status queued|in_progress|blocked|done|abandoned] [--priority <p0|p1|p2|p3>] [--title <text>] [--body <text>] [--blocked-reason <text>] [--abandoned-reason <text>] [--depends-on <id1,id2>] [--branch <branch>] [--progress-note <text>] [--due-date <YYYY-MM-DD>] [--links '<json array>']
+
+Purpose:
+  Updates an existing backlog item after work starts, changes priority, becomes
+  blocked, finishes, or needs better recovery context.
+
+Flags:
+  --id <item-id>              Required backlog item ID.
+  --status <status>           queued, in_progress, blocked, done, or abandoned.
+  --priority <priority>       p0, p1, p2, or p3.
+  --title <text>              Replacement title.
+  --body <text>               Replacement body.
+  --blocked-reason <text>     Required when --status blocked.
+  --abandoned-reason <text>   Required when --status abandoned.
+  --depends-on <id1,id2>      Replacement comma-separated dependency item IDs.
+  --branch <branch>           Branch where work is happening.
+  --progress-note <text>      Progress or recovery note. status=in_progress requires --branch or --progress-note.
+  --due-date <YYYY-MM-DD>     Replacement due date.
+  --links '<json array>'      Replacement JSON array of related links.
+
+Rules:
+  status=blocked requires --blocked-reason.
+  status=abandoned requires --abandoned-reason.
+  status=in_progress requires either --branch or --progress-note.
+
+Output:
+  JSON object for the updated backlog item, including console_url.
+
+Examples:
+  backlog update-item --id ai-tools--tooling--document-backlog-cli --status in_progress --branch docs/backlog-help
+  backlog update-item --id ai-tools--tooling--document-backlog-cli --status blocked --blocked-reason "Waiting for database access"
+  backlog update-item --id ai-tools--tooling--document-backlog-cli --status done --progress-note "Help docs added and tests pass"
+`,
+};
+
+const GENERAL_HELP = `
+Usage: backlog <command> [--flags]
+       backlog help <command>
+       backlog <command> --help
+
+Purpose:
+  Use this CLI when an AI or human needs to inspect or update the shared GourmetPro backlog
+  from any terminal, including repos that do not contain the backlog source code.
+  The CLI mirrors the /mcp/backlog MCP tools and talks directly to the configured
+  Postgres database through psql.
+
+Commands:
+  list-repos
+      Show registered repositories and their short slugs.
+  create-repo --slug <org/repo> --short-slug <short> --display-name <name>
+      Register a repository for backlog ownership.
+  list-items [--repo <org/repo>] [--workstream <name>] [--status <csv>]
+      Search backlog items with filters.
+  get-item --id <item-id>
+      Read one item and the items it blocks.
+  summarize [--workstream <name>] [--repo <org/repo>]
+      Count items by workstream and status.
+  create-item --repo <org/repo> --workstream <name> --title <text> --type engineering|spec_pending_impl|wiki_ops
+      Create a tracked backlog item.
+  update-item --id <item-id> [--status queued|in_progress|blocked|done|abandoned]
+      Update status, priority, metadata, dependencies, and notes.
+
+AI workflow:
+  1. Run backlog list-repos to discover valid --repo values.
+  2. Run backlog list-items or backlog summarize before creating new work.
+  3. Use backlog get-item before changing an item you did not just create.
+  4. Use create-item for durable follow-up work that should survive the chat.
+  5. Use update-item to record progress, branches, blockers, completion, and links.
+
+Configuration:
+  Reads DATABASE_URL from ~/.config/ai-tools/backlog.conf by default.
+  Set BACKLOG_CONFIG to use another config file.
+  Set BACKLOG_DATABASE_URL for a one-off session override.
+  The config file should contain: DATABASE_URL='postgres://user:pass@host/db'
+
+Output:
+  Successful commands print pretty JSON to stdout.
+  Failures print one line to stderr and exit non-zero.
+
+links JSON:
+  --links accepts a JSON array. Supported objects:
+  [{"kind":"spec","repo":"org/repo","path":"docs/spec.md"}]
+  [{"kind":"brief","repo":"org/repo","path":"briefs/customer.md"}]
+  [{"kind":"pr","url":"https://github.com/org/repo/pull/123"}]
+  [{"kind":"commit","repo":"org/repo","sha":"abcdef1"}]
+  [{"kind":"url","url":"https://example.com/context"}]
+
+Examples:
+  backlog list-repos
+  backlog list-items --repo GourmetPro/ai-tools --status queued,in_progress
+  backlog create-item --repo GourmetPro/ai-tools --workstream tooling --title "Document backlog CLI help" --type engineering
+  backlog update-item --id ai-tools--tooling--document-backlog-cli --status done --progress-note "Documented CLI help"
+
+Try: backlog --help
+Try: backlog help <command>
+`.trim();
+
+function helpTextFor(command) {
+  return (commandDocs[command] || GENERAL_HELP).trim();
+}
+
+function printHelp(command, stream = process.stdout) {
+  stream.write(`${helpTextFor(command)}\n`);
+}
+
+function printUsageError(message) {
+  if (message) console.error(`tools/backlog: ${message}`);
+  printHelp(null, process.stderr);
+  process.exit(2);
+}
+
 const [cmd, ...rest] = process.argv.slice(2);
+if (!cmd || cmd === '-h' || cmd === '--help') {
+  if (!cmd) printUsageError();
+  printHelp();
+  process.exit(0);
+}
+if (cmd === 'help') {
+  if (rest.length > 1) printUsageError('usage: backlog help [command]');
+  const helpCommand = rest[0];
+  if (helpCommand && !commands[helpCommand]) {
+    printUsageError(`unknown command: ${helpCommand}`);
+  }
+  printHelp(helpCommand);
+  process.exit(0);
+}
 if (!cmd || !commands[cmd]) {
-  fail(`usage: tools/backlog <${Object.keys(commands).join('|')}> [--flags] (see header comment)`);
+  printUsageError(`unknown command: ${cmd}`);
+}
+if (rest.includes('-h') || rest.includes('--help')) {
+  printHelp(cmd);
+  process.exit(0);
 }
 const args = parseArgs(rest);
 for (const k of Object.keys(args)) {

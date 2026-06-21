@@ -30,7 +30,7 @@ assert_contains() {
   local needle="$1"
   local file="$2"
   local message="$3"
-  if ! grep -Fq "$needle" "$file"; then
+  if ! grep -Fq -- "$needle" "$file"; then
     fail "$message: expected to find [$needle] in $file"
     return 1
   fi
@@ -109,6 +109,69 @@ test_backlog_explains_missing_config() {
   fi
   assert_contains "DATABASE_URL is not configured" "$tmp/err" "missing config error" || return 1
   assert_contains "$tmp/missing.conf" "$tmp/err" "missing config path" || return 1
+}
+
+test_backlog_documents_cli_for_agents() {
+  local tmp="$1"
+
+  BACKLOG_CONFIG="$tmp/missing.conf" BACKLOG_DATABASE_URL= "$ROOT/tools/backlog" --help > "$tmp/help.out" 2> "$tmp/help.err" || {
+    fail "backlog --help should succeed without database config; stderr was: $(<"$tmp/help.err")"
+    return 1
+  }
+  assert_eq '' "$(<"$tmp/help.err")" "backlog --help stderr" || return 1
+  assert_contains "Purpose:" "$tmp/help.out" "help explains purpose" || return 1
+  assert_contains "Use this CLI when an AI or human needs to inspect or update the shared GourmetPro backlog" "$tmp/help.out" "help explains when to use backlog" || return 1
+  assert_contains "Commands:" "$tmp/help.out" "help lists commands" || return 1
+  assert_contains "create-item --repo <org/repo> --workstream <name> --title <text> --type engineering|spec_pending_impl|wiki_ops" "$tmp/help.out" "help documents create-item" || return 1
+  assert_contains "AI workflow:" "$tmp/help.out" "help includes AI workflow" || return 1
+  assert_contains "links JSON:" "$tmp/help.out" "help documents links JSON" || return 1
+
+  local commands=(list-repos create-repo list-items get-item summarize create-item update-item)
+  local command
+  for command in "${commands[@]}"; do
+    BACKLOG_CONFIG="$tmp/missing.conf" BACKLOG_DATABASE_URL= "$ROOT/tools/backlog" "$command" --help > "$tmp/$command.help.out" 2> "$tmp/$command.help.err" || {
+      fail "backlog $command --help should succeed without database config; stderr was: $(<"$tmp/$command.help.err")"
+      return 1
+    }
+    assert_eq '' "$(<"$tmp/$command.help.err")" "backlog $command --help stderr" || return 1
+    assert_contains "Usage: backlog $command" "$tmp/$command.help.out" "$command help includes usage" || return 1
+    assert_contains "Purpose:" "$tmp/$command.help.out" "$command help explains purpose" || return 1
+    assert_contains "Examples:" "$tmp/$command.help.out" "$command help includes examples" || return 1
+  done
+
+  assert_contains "Usage: backlog list-repos" "$tmp/list-repos.help.out" "list-repos help usage" || return 1
+  assert_contains "Shows repositories registered for backlog item ownership" "$tmp/list-repos.help.out" "list-repos help purpose" || return 1
+  assert_contains "Usage: backlog create-repo --slug <org/repo> --short-slug <short> --display-name <name>" "$tmp/create-repo.help.out" "create-repo help usage" || return 1
+  assert_contains "--color <#RRGGBB>" "$tmp/create-repo.help.out" "create-repo help documents color" || return 1
+  assert_contains "Usage: backlog list-items [--repo <org/repo>] [--workstream <name>]" "$tmp/list-items.help.out" "list-items help usage" || return 1
+  assert_contains "--status <queued,in_progress,blocked,done,abandoned>" "$tmp/list-items.help.out" "list-items help documents statuses" || return 1
+  assert_contains "Usage: backlog get-item --id <item-id>" "$tmp/get-item.help.out" "get-item help usage" || return 1
+  assert_contains "Includes a blocks array" "$tmp/get-item.help.out" "get-item help explains blocks" || return 1
+  assert_contains "Usage: backlog summarize [--workstream <name>] [--repo <org/repo>]" "$tmp/summarize.help.out" "summarize help usage" || return 1
+  assert_contains "Counts backlog items by workstream and status" "$tmp/summarize.help.out" "summarize help purpose" || return 1
+  assert_contains "Usage: backlog create-item --repo <org/repo> --workstream <name> --title <text> --type engineering|spec_pending_impl|wiki_ops" "$tmp/create-item.help.out" "create-item help usage" || return 1
+  assert_contains "--source-context <text>" "$tmp/create-item.help.out" "create-item help documents source context" || return 1
+  assert_contains "Usage: backlog update-item --id <item-id> [--status queued|in_progress|blocked|done|abandoned]" "$tmp/update-item.help.out" "update-item help usage" || return 1
+  assert_contains "status=blocked requires --blocked-reason" "$tmp/update-item.help.out" "update-item help documents blocked reason" || return 1
+
+  BACKLOG_CONFIG="$tmp/missing.conf" BACKLOG_DATABASE_URL= "$ROOT/tools/backlog" help update-item > "$tmp/help-command.out" 2> "$tmp/help-command.err" || {
+    fail "backlog help update-item should succeed without database config; stderr was: $(<"$tmp/help-command.err")"
+    return 1
+  }
+  assert_eq '' "$(<"$tmp/help-command.err")" "backlog help update-item stderr" || return 1
+  assert_contains "Usage: backlog update-item" "$tmp/help-command.out" "help subcommand returns command docs" || return 1
+
+  if BACKLOG_CONFIG="$tmp/missing.conf" BACKLOG_DATABASE_URL= "$ROOT/tools/backlog" > "$tmp/bare.out" 2> "$tmp/bare.err"; then
+    fail "bare backlog should exit non-zero after printing usage"
+    return 1
+  fi
+  assert_eq '' "$(<"$tmp/bare.out")" "bare backlog stdout" || return 1
+  assert_contains "Purpose:" "$tmp/bare.err" "bare backlog includes docs on stderr" || return 1
+  assert_contains "Try: backlog --help" "$tmp/bare.err" "bare backlog points to help" || return 1
+  if grep -Fq "see header comment" "$tmp/bare.err"; then
+    fail "bare backlog should not refer to source header comments"
+    return 1
+  fi
 }
 
 test_wt_installs_separately() {
@@ -274,6 +337,7 @@ test_bump_homebrew_release_script_bumps_semver_levels() {
 run_test "wt runs as a standalone executable" test_wt_runs_as_executable
 run_test "backlog reads DATABASE_URL from editable config" with_tmpdir test_backlog_reads_database_url_from_config
 run_test "backlog explains missing config" with_tmpdir test_backlog_explains_missing_config
+run_test "backlog documents CLI usage for agents" with_tmpdir test_backlog_documents_cli_for_agents
 run_test "wt has its own installer" with_tmpdir test_wt_installs_separately
 run_test "backlog has its own installer and config setup" with_tmpdir test_backlog_installs_separately_and_writes_config
 run_test "backlog installer creates skippable blank config template" with_tmpdir test_backlog_installer_creates_blank_config_template
