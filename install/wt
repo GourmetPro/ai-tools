@@ -1,0 +1,76 @@
+#!/usr/bin/env sh
+set -eu
+
+usage() {
+  cat <<'EOF'
+Usage: install/wt [--bin-dir DIR] [--force]
+
+Installs the wt executable by symlinking tools/wt into DIR.
+Default DIR: $AI_TOOLS_BIN_DIR, or ~/.local/bin.
+EOF
+}
+
+die() {
+  printf 'install/wt: %s\n' "$1" >&2
+  exit 2
+}
+
+bin_dir="${AI_TOOLS_BIN_DIR:-}"
+force=0
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --bin-dir)
+      [ "$#" -ge 2 ] || die '--bin-dir requires a value'
+      bin_dir="$2"
+      shift 2
+      ;;
+    --bin-dir=*)
+      bin_dir="${1#--bin-dir=}"
+      shift
+      ;;
+    --force)
+      force=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown argument: $1"
+      ;;
+  esac
+done
+
+if [ -z "$bin_dir" ]; then
+  [ -n "${HOME:-}" ] || die 'HOME is not set; pass --bin-dir'
+  bin_dir="$HOME/.local/bin"
+fi
+
+script_dir="$(CDPATH= cd "$(dirname "$0")" && pwd -P)"
+repo_dir="$(CDPATH= cd "$script_dir/.." && pwd -P)"
+tool_path="$repo_dir/tools/wt"
+target="$bin_dir/wt"
+
+[ -f "$tool_path" ] || die "missing tool: $tool_path"
+mkdir -p "$bin_dir"
+chmod +x "$tool_path"
+
+if [ -e "$target" ] || [ -L "$target" ]; then
+  if [ -L "$target" ] && [ "$(readlink "$target")" = "$tool_path" ]; then
+    rm -f "$target"
+  elif [ "$force" -eq 1 ]; then
+    rm -f "$target"
+  else
+    die "$target already exists; pass --force to replace it"
+  fi
+fi
+
+ln -s "$tool_path" "$target"
+printf 'Installed wt -> %s\n' "$target"
+
+case ":${PATH:-}:" in
+  *":$bin_dir:"*) ;;
+  *) printf 'Note: %s is not currently on PATH.\n' "$bin_dir" >&2 ;;
+esac

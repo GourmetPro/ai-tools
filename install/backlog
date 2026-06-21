@@ -1,0 +1,142 @@
+#!/usr/bin/env sh
+set -eu
+
+usage() {
+  cat <<'EOF'
+Usage: install/backlog [--bin-dir DIR] [--config FILE] [--database-url URL] [--force]
+
+Installs the backlog executable by symlinking tools/backlog into DIR.
+Default DIR: $AI_TOOLS_BIN_DIR, or ~/.local/bin.
+Default config: $BACKLOG_CONFIG, or $XDG_CONFIG_HOME/ai-tools/backlog.conf, or ~/.config/ai-tools/backlog.conf.
+
+If the config file does not exist, pass --database-url URL or run from a TTY
+to enter it interactively. Edit the config file later to change databases.
+EOF
+}
+
+die() {
+  printf 'install/backlog: %s\n' "$1" >&2
+  exit 2
+}
+
+bin_dir="${AI_TOOLS_BIN_DIR:-}"
+config_path="${BACKLOG_CONFIG:-}"
+database_url=""
+force=0
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --bin-dir)
+      [ "$#" -ge 2 ] || die '--bin-dir requires a value'
+      bin_dir="$2"
+      shift 2
+      ;;
+    --bin-dir=*)
+      bin_dir="${1#--bin-dir=}"
+      shift
+      ;;
+    --config)
+      [ "$#" -ge 2 ] || die '--config requires a value'
+      config_path="$2"
+      shift 2
+      ;;
+    --config=*)
+      config_path="${1#--config=}"
+      shift
+      ;;
+    --database-url)
+      [ "$#" -ge 2 ] || die '--database-url requires a value'
+      database_url="$2"
+      shift 2
+      ;;
+    --database-url=*)
+      database_url="${1#--database-url=}"
+      shift
+      ;;
+    --force)
+      force=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown argument: $1"
+      ;;
+  esac
+done
+
+if [ -z "$bin_dir" ]; then
+  [ -n "${HOME:-}" ] || die 'HOME is not set; pass --bin-dir'
+  bin_dir="$HOME/.local/bin"
+fi
+
+if [ -z "$config_path" ]; then
+  if [ -n "${XDG_CONFIG_HOME:-}" ]; then
+    config_path="$XDG_CONFIG_HOME/ai-tools/backlog.conf"
+  else
+    [ -n "${HOME:-}" ] || die 'HOME is not set; pass --config'
+    config_path="$HOME/.config/ai-tools/backlog.conf"
+  fi
+fi
+
+script_dir="$(CDPATH= cd "$(dirname "$0")" && pwd -P)"
+repo_dir="$(CDPATH= cd "$script_dir/.." && pwd -P)"
+tool_path="$repo_dir/tools/backlog"
+target="$bin_dir/backlog"
+
+[ -f "$tool_path" ] || die "missing tool: $tool_path"
+mkdir -p "$bin_dir"
+chmod +x "$tool_path"
+
+if [ -z "$database_url" ] && [ ! -f "$config_path" ]; then
+  if [ -t 0 ]; then
+    printf 'DATABASE_URL: ' >&2
+    IFS= read -r database_url
+  else
+    die "missing config $config_path; pass --database-url"
+  fi
+fi
+
+if [ -n "$database_url" ]; then
+  case "$database_url" in
+    *"'"*) die "database URL contains a single quote; edit $config_path manually with double quotes" ;;
+  esac
+  if [ -e "$config_path" ] && [ "$force" -ne 1 ]; then
+    die "$config_path already exists; pass --force to replace it"
+  fi
+fi
+
+if [ -e "$target" ] || [ -L "$target" ]; then
+  if [ -L "$target" ] && [ "$(readlink "$target")" = "$tool_path" ]; then
+    rm -f "$target"
+  elif [ "$force" -eq 1 ]; then
+    rm -f "$target"
+  else
+    die "$target already exists; pass --force to replace it"
+  fi
+fi
+
+ln -s "$tool_path" "$target"
+
+if [ -n "$database_url" ]; then
+  mkdir -p "$(dirname "$config_path")"
+  umask 077
+  tmp_config="$config_path.tmp.$$"
+  {
+    printf '# Backlog CLI configuration\n'
+    printf "# Edit this file to change the database used by tools/backlog.\n"
+    printf "DATABASE_URL='%s'\n" "$database_url"
+  } > "$tmp_config"
+  mv "$tmp_config" "$config_path"
+  chmod 600 "$config_path"
+fi
+
+printf 'Installed backlog -> %s\n' "$target"
+printf 'Backlog config: %s\n' "$config_path"
+
+case ":${PATH:-}:" in
+  *":$bin_dir:"*) ;;
+  *) printf 'Note: %s is not currently on PATH.\n' "$bin_dir" >&2 ;;
+esac

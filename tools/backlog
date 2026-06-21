@@ -1,0 +1,437 @@
+#!/usr/bin/env node
+// Backlog CLI — mimics the /mcp/backlog MCP tools by talking straight to the
+// configured database. It reads DATABASE_URL from an editable config file
+// (default: ~/.config/ai-tools/backlog.conf; override with BACKLOG_CONFIG).
+// BACKLOG_DATABASE_URL can override the file for one-off agent sessions.
+// Prints JSON to stdout. Non-zero exit + one-line stderr on failure.
+// Requires `psql` on PATH (same as tools/psql).
+//
+// Flags accept `--flag value` or `--flag=value` (use the latter for values
+// that themselves start with `--`). Unknown flags are rejected.
+//
+// Subcommands (≈ MCP tool):
+//   tools/backlog list-repos
+//   tools/backlog create-repo --slug <gh-slug> --short-slug <s> --display-name <n> [--default-branch main] [--color <hex>]
+//   tools/backlog list-items [--repo R] [--workstream W] [--status s1,s2] [--type T] [--priority P] [--q TEXT] [--limit N] [--offset N]
+//   tools/backlog get-item --id <id>
+//   tools/backlog summarize [--workstream W] [--repo R]
+//   tools/backlog create-item --repo <gh-slug> --workstream <w> --title <t> --type engineering|spec_pending_impl|wiki_ops
+//                             [--body B] [--priority p0|p1|p2|p3] [--source-context C] [--depends-on id1,id2]
+//                             [--branch BR] [--progress-note N] [--due-date YYYY-MM-DD] [--links '<json array>'] [--id <explicit-id>]
+//   tools/backlog update-item --id <id> [--status queued|in_progress|blocked|done|abandoned] [--priority P] [--title T]
+//                             [--body B] [--blocked-reason R] [--abandoned-reason R] [--depends-on id1,id2]
+//                             [--branch BR] [--progress-note N] [--due-date D] [--links '<json array>']
+//
+// Input rules mirror code/console/src/lib/schemas/backlog{,-repo}.ts and
+// lib/backlog-palette.ts — keep in sync. Mutations write a console_audit_log
+// row (actor: tools-backlog) in the same transaction, mirroring the MCP entity
+// layer. Skipped vs MCP: dep_status / cycle detection, link→registered-repo
+// checks, and Next.js cache invalidation — the console UI and the MCP read
+// tools may serve cached pre-mutation state for a few minutes after a CLI write.
+
+const fs = require('fs');
+const path = require('path');
+const { spawnSync } = require('child_process');
+
+const CONSOLE_BASE_URL = 'https://gtm.gourmetpro.co';
+const ACTOR = { userId: 'tools-backlog', email: 'tools-backlog@gourmetpro.co' };
+
+function fail(msg) {
+  console.error(`tools/backlog: ${msg}`);
+  process.exit(2);
+}
+
+// --- config loading: BACKLOG_DATABASE_URL > editable config file -----------------
+function defaultConfigPath() {
+  const configHome = process.env.XDG_CONFIG_HOME
+    || (process.env.HOME ? path.join(process.env.HOME, '.config') : null);
+  if (!configHome) {
+    fail('HOME is not set; set BACKLOG_CONFIG to an explicit backlog.conf path');
+  }
+  return path.join(configHome, 'ai-tools', 'backlog.conf');
+}
+
+function cleanConfigValue(raw) {
+  let v = raw.trim();
+  if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
+    v = v.slice(1, -1);
+  }
+  return v;
+}
+
+function loadConfigFile(file) {
+  const out = {};
+  if (!fs.existsSync(file)) return out;
+  for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const m = trimmed.match(/^(?:export\s+)?([A-Z_][A-Z0-9_]*)=(.*)$/);
+    if (!m) continue;
+    out[m[1]] = cleanConfigValue(m[2]);
+  }
+  return out;
+}
+
+const CONFIG_PATH = process.env.BACKLOG_CONFIG || defaultConfigPath();
+const CONFIG = loadConfigFile(CONFIG_PATH);
+const DB_URL = process.env.BACKLOG_DATABASE_URL || CONFIG.DATABASE_URL;
+if (!DB_URL) {
+  fail(`DATABASE_URL is not configured. Edit ${CONFIG_PATH} or run install/backlog --database-url '<postgres-url>'.`);
+}
+
+// --- psql helpers --------------------------------------------------------------
+function runSql(sql) {
+  const res = spawnSync('psql', [DB_URL, '-X', '-q', '-At', '-v', 'ON_ERROR_STOP=1', '-c', sql], {
+    encoding: 'utf8',
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  if (res.error) fail(`psql spawn failed: ${res.error.message}`);
+  if (res.status !== 0) fail(`psql error: ${(res.stderr || '').trim()}`);
+  return res.stdout.trim();
+}
+function queryJson(sql) {
+  const out = runSql(sql);
+  return out ? JSON.parse(out) : null;
+}
+
+// SQL literal builders. lit() doubles single quotes; never interpolate raw input.
+function lit(v) {
+  if (v === null || v === undefined) return 'NULL';
+  return `'${String(v).replace(/'/g, "''")}'`;
+}
+function textArray(arr) {
+  if (!arr.length) return `'{}'::text[]`;
+  return `ARRAY[${arr.map(lit).join(',')}]::text[]`;
+}
+function jsonbLit(v) {
+  return `${lit(JSON.stringify(v))}::jsonb`;
+}
+function intLit(v, name) {
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 0) fail(`--${name} must be a non-negative integer`);
+  return n;
+}
+
+// --- arg parsing: --flag value | --flag=value pairs ------------------------------
+function parseArgs(argv) {
+  const args = {};
+  for (let i = 0; i < argv.length; i++) {
+    if (!argv[i].startsWith('--')) fail(`unexpected argument: ${argv[i]}`);
+    let key = argv[i].slice(2);
+    let val;
+    const eq = key.indexOf('=');
+    if (eq !== -1) {
+      val = key.slice(eq + 1);
+      key = key.slice(0, eq);
+    } else {
+      val = argv[++i];
+      if (val === undefined) fail(`--${key} requires a value`);
+    }
+    args[key] = val;
+  }
+  return args;
+}
+function require_(args, keys) {
+  for (const k of keys) if (args[k] === undefined) fail(`--${k} is required`);
+}
+function oneOf(args, key, allowed) {
+  if (args[key] !== undefined && !allowed.includes(args[key])) {
+    fail(`--${key} must be one of: ${allowed.join(', ')}`);
+  }
+}
+function checkLen(args, key, min, max) {
+  const v = args[key];
+  if (v === undefined) return;
+  if (v.length < min) fail(`--${key} must be at least ${min} character${min === 1 ? '' : 's'}`);
+  if (v.length > max) fail(`--${key} must be at most ${max} characters`);
+}
+
+const STATUSES = ['queued', 'in_progress', 'blocked', 'done', 'abandoned'];
+const PRIORITIES = ['p0', 'p1', 'p2', 'p3'];
+const TYPES = ['engineering', 'spec_pending_impl', 'wiki_ops'];
+
+// Mirrors code/console/src/lib/schemas/backlog.ts, backlog-repo.ts, backlog-palette.ts.
+const ID_REGEX = /^[a-z0-9-]+--[a-z0-9-]+--[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
+const GITHUB_SLUG_REGEX = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+const SHORT_SLUG_REGEX = /^[a-z0-9-]+$/;
+const HEX_COLOR_REGEX = /^#[0-9A-Fa-f]{6}$/;
+const ISO_DATE_REGEX = /^\d{4}-\d{2}-\d{2}$/;
+const REPO_PALETTE = ['#1A4D4A', '#9C6A2F', '#2D3A6B', '#6B2D5F', '#4A5D2E', '#8A2D2D'];
+
+// Mirrors src/lib/schemas/backlog.ts slugify.
+function slugify(input) {
+  return input.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 80);
+}
+function withConsoleUrl(row) {
+  return row ? { ...row, console_url: `${CONSOLE_BASE_URL}/work/backlog/${row.id}` } : row;
+}
+// Audit row written in the same statement, selecting FROM the mutation CTE so a
+// zero-row mutation writes no audit row.
+function auditInsertSql(entity, entityIdExpr, action, beforeExpr, afterExpr, fromCte) {
+  return `INSERT INTO console_audit_log (actor_user_id, actor_email, entity, entity_id, action, before, after)
+          SELECT ${lit(ACTOR.userId)}, ${lit(ACTOR.email)}, ${lit(entity)}, ${entityIdExpr}, ${lit(action)}, ${beforeExpr}, ${afterExpr} FROM ${fromCte}`;
+}
+
+// --- input validation (mirrors the zod input schemas) ---------------------------
+function isHttpUrl(v) {
+  if (typeof v !== 'string') return false;
+  try { new URL(v); return true; } catch { return false; }
+}
+function validateLink(l, i) {
+  const bad = (msg) => fail(`--links[${i}]: ${msg}`);
+  if (typeof l !== 'object' || l === null || Array.isArray(l)) bad('must be an object');
+  const repoOk = l.repo === undefined || (typeof l.repo === 'string' && GITHUB_SLUG_REGEX.test(l.repo));
+  switch (l.kind) {
+    case 'spec':
+    case 'brief':
+      if (typeof l.path !== 'string' || !l.path.length) bad(`kind=${l.kind} requires a non-empty "path"`);
+      if (!repoOk) bad('"repo" must be a full GitHub slug <org>/<repo>');
+      break;
+    case 'pr':
+      if (!isHttpUrl(l.url)) bad('kind=pr requires a valid absolute "url"');
+      break;
+    case 'commit':
+      if (typeof l.sha !== 'string' || l.sha.length < 7) bad('kind=commit requires "sha" (min 7 chars)');
+      if (!repoOk) bad('"repo" must be a full GitHub slug <org>/<repo>');
+      break;
+    case 'url':
+      if (!isHttpUrl(l.url)) bad('kind=url requires a valid absolute "url"');
+      break;
+    default:
+      bad(`unknown "kind" ${JSON.stringify(l.kind)} (spec|brief|pr|commit|url)`);
+  }
+}
+function parseLinks(args) {
+  if (args.links === undefined) return undefined;
+  let links;
+  try { links = JSON.parse(args.links); } catch (e) { fail(`--links is not valid JSON: ${e.message}`); }
+  if (!Array.isArray(links)) fail('--links must be a JSON array');
+  links.forEach(validateLink);
+  return links;
+}
+// Format + uniqueness only; self-reference is checked by the caller once the
+// (possibly derived) item id is known.
+function parseDependsOn(raw) {
+  const arr = raw.split(',').filter(Boolean);
+  for (const d of arr) {
+    if (!ID_REGEX.test(d)) fail(`--depends-on entry "${d}" must match <short-slug>--<workstream>--<kebab-slug>`);
+  }
+  if (new Set(arr).size !== arr.length) fail('--depends-on entries must be unique');
+  return arr;
+}
+function validateItemFields(args) {
+  checkLen(args, 'workstream', 1, 64);
+  checkLen(args, 'title', 1, 200);
+  if (args.branch !== undefined) {
+    args.branch = args.branch.trim();
+    checkLen(args, 'branch', 0, 255);
+  }
+  if (args['progress-note'] !== undefined) {
+    args['progress-note'] = args['progress-note'].trim();
+    checkLen(args, 'progress-note', 0, 2000);
+  }
+  if (args['due-date'] !== undefined && !ISO_DATE_REGEX.test(args['due-date'])) {
+    fail('--due-date must be YYYY-MM-DD');
+  }
+}
+
+// --- subcommands ---------------------------------------------------------------
+function cmdListRepos() {
+  return queryJson(`SELECT coalesce(json_agg(row_to_json(t)), '[]') FROM
+    (SELECT * FROM backlog_repos ORDER BY slug) t`);
+}
+
+function cmdCreateRepo(args) {
+  require_(args, ['slug', 'short-slug', 'display-name']);
+  if (!GITHUB_SLUG_REGEX.test(args.slug)) fail('--slug must be a full GitHub slug <org>/<repo>');
+  if (!SHORT_SLUG_REGEX.test(args['short-slug'])) fail('--short-slug must be lowercase kebab ([a-z0-9-])');
+  checkLen(args, 'short-slug', 1, 32);
+  checkLen(args, 'display-name', 1, 64);
+  if (args['default-branch'] !== undefined) checkLen(args, 'default-branch', 1, 64);
+  if (args.color !== undefined && !HEX_COLOR_REGEX.test(args.color)) fail('--color must be #RRGGBB');
+
+  let color = args.color;
+  if (!color) {
+    const taken = queryJson(`SELECT coalesce(json_agg(color), '[]') FROM backlog_repos`);
+    const takenSet = new Set(taken.map((c) => c.toUpperCase()));
+    color = REPO_PALETTE.find((c) => !takenSet.has(c.toUpperCase()));
+    if (!color) fail('color palette exhausted — pass --color explicitly (#RRGGBB)');
+  }
+  return queryJson(`
+    WITH ins AS (
+      INSERT INTO backlog_repos (slug, short_slug, display_name, default_branch, color)
+      VALUES (${lit(args.slug)}, ${lit(args['short-slug'])}, ${lit(args['display-name'])},
+              ${lit(args['default-branch'] ?? 'main')}, ${lit(color)})
+      RETURNING *
+    ),
+    aud AS (
+      ${auditInsertSql('backlog_repos', 'ins.slug', 'create', 'NULL', 'row_to_json(ins)::jsonb', 'ins')}
+    )
+    SELECT row_to_json(ins) FROM ins`);
+}
+
+function cmdListItems(args) {
+  oneOf(args, 'type', TYPES);
+  oneOf(args, 'priority', PRIORITIES);
+  for (const k of ['repo', 'workstream', 'status', 'type', 'priority', 'q']) {
+    if (args[k] === '') fail(`--${k} must not be empty`);
+  }
+  const conds = [];
+  if (args.repo) conds.push(`repo = ${lit(args.repo)}`);
+  if (args.workstream) conds.push(`workstream = ${lit(args.workstream)}`);
+  if (args.status) {
+    const statuses = args.status.split(',');
+    for (const s of statuses) if (!STATUSES.includes(s)) fail(`bad status "${s}"`);
+    conds.push(`status IN (${statuses.map(lit).join(',')})`);
+  }
+  if (args.type) conds.push(`type = ${lit(args.type)}`);
+  if (args.priority) conds.push(`priority = ${lit(args.priority)}`);
+  if (args.q) {
+    const esc = args.q.replace(/([\\%_])/g, '\\$1'); // literal match: escape ILIKE metachars
+    conds.push(`(title ILIKE ${lit('%' + esc + '%')} OR body ILIKE ${lit('%' + esc + '%')})`);
+  }
+  const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
+  const limit = Math.min(args.limit !== undefined ? intLit(args.limit, 'limit') : 50, 500);
+  const offset = args.offset !== undefined ? intLit(args.offset, 'offset') : 0;
+  const rows = queryJson(`SELECT coalesce(json_agg(row_to_json(t)), '[]') FROM
+    (SELECT * FROM backlog_items ${where} ORDER BY priority ASC, created_at DESC LIMIT ${limit} OFFSET ${offset}) t`);
+  return rows.map(withConsoleUrl);
+}
+
+function cmdGetItem(args) {
+  require_(args, ['id']);
+  const row = queryJson(`SELECT row_to_json(t) FROM (SELECT * FROM backlog_items WHERE id = ${lit(args.id)}) t`);
+  if (!row) fail(`not_found: ${args.id}`);
+  const blocks = queryJson(`SELECT coalesce(json_agg(row_to_json(t)), '[]') FROM
+    (SELECT id, title, status, repo FROM backlog_items WHERE depends_on @> ARRAY[${lit(args.id)}]::text[]) t`);
+  return { ...withConsoleUrl(row), blocks };
+}
+
+function cmdSummarize(args) {
+  const conds = [];
+  for (const k of ['workstream', 'repo']) {
+    if (args[k] === '') fail(`--${k} must not be empty`);
+  }
+  if (args.workstream) conds.push(`workstream = ${lit(args.workstream)}`);
+  if (args.repo) conds.push(`repo = ${lit(args.repo)}`);
+  const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
+  return queryJson(`SELECT coalesce(json_agg(row_to_json(t)), '[]') FROM
+    (SELECT workstream, status, count(*)::int AS count FROM backlog_items ${where}
+     GROUP BY workstream, status ORDER BY workstream, status) t`);
+}
+
+function cmdCreateItem(args) {
+  require_(args, ['repo', 'workstream', 'title', 'type']);
+  oneOf(args, 'type', TYPES);
+  oneOf(args, 'priority', PRIORITIES);
+  if (!GITHUB_SLUG_REGEX.test(args.repo)) fail('--repo must be a full GitHub slug <org>/<repo> — run `tools/backlog list-repos` for the registered set');
+  validateItemFields(args);
+  if (args.id !== undefined && !ID_REGEX.test(args.id)) {
+    fail('--id must match <short-slug>--<workstream>--<kebab-slug> (lowercase kebab)');
+  }
+  const links = parseLinks(args) ?? [];
+  const dependsOn = args['depends-on'] !== undefined ? parseDependsOn(args['depends-on']) : [];
+
+  let id = args.id;
+  if (!id) {
+    const repoRow = queryJson(`SELECT row_to_json(t) FROM (SELECT short_slug FROM backlog_repos WHERE slug = ${lit(args.repo)}) t`);
+    if (!repoRow) fail(`repo "${args.repo}" is not registered — run \`tools/backlog list-repos\` or create-repo first`);
+    id = `${repoRow.short_slug}--${slugify(args.workstream)}--${slugify(args.title)}`;
+  }
+  if (dependsOn.includes(id)) fail("self-reference: depends_on cannot contain the item's own id");
+
+  const row = queryJson(`
+    WITH ins AS (
+      INSERT INTO backlog_items (id, repo, workstream, title, type, body, priority, links,
+                                 source_context, depends_on, branch, progress_note, due_date)
+      VALUES (${lit(id)}, ${lit(args.repo)}, ${lit(args.workstream)}, ${lit(args.title)}, ${lit(args.type)},
+              ${lit(args.body ?? null)}, ${lit(args.priority ?? 'p2')}, ${jsonbLit(links)},
+              ${lit(args['source-context'] ?? null)}, ${textArray(dependsOn)},
+              ${lit(args.branch ?? null)}, ${lit(args['progress-note'] ?? null)}, ${lit(args['due-date'] ?? null)})
+      RETURNING *
+    ),
+    aud AS (
+      ${auditInsertSql('backlog_items', 'ins.id', 'create', 'NULL', 'row_to_json(ins)::jsonb', 'ins')}
+    )
+    SELECT row_to_json(ins) FROM ins`);
+  return withConsoleUrl(row);
+}
+
+function cmdUpdateItem(args) {
+  require_(args, ['id']);
+  oneOf(args, 'status', STATUSES);
+  oneOf(args, 'priority', PRIORITIES);
+  validateItemFields(args);
+  const links = parseLinks(args);
+  const dependsOn = args['depends-on'] !== undefined ? parseDependsOn(args['depends-on']) : undefined;
+  if (dependsOn?.includes(args.id)) fail("self-reference: depends_on cannot contain the item's own id");
+
+  // Entity-layer rules replicated from actions-internal.ts:
+  if (args.status === 'blocked' && !(args['blocked-reason'] || '').trim()) fail('status=blocked requires a non-empty --blocked-reason');
+  if (args.status === 'abandoned' && !(args['abandoned-reason'] || '').trim()) fail('status=abandoned requires a non-empty --abandoned-reason');
+
+  const before = queryJson(`SELECT row_to_json(t) FROM (SELECT * FROM backlog_items WHERE id = ${lit(args.id)}) t`);
+  if (!before) fail(`not_found: ${args.id}`);
+
+  const resultingStatus = args.status ?? before.status;
+  const resultingBranch = args.branch !== undefined ? args.branch : before.branch;
+  const resultingNote = args['progress-note'] !== undefined ? args['progress-note'] : before.progress_note;
+  if (resultingStatus === 'in_progress' && !(resultingBranch || '').trim() && !(resultingNote || '').trim()) {
+    fail('in_progress requires either --branch or --progress-note (recovery signal)');
+  }
+
+  const sets = ['updated_at = now()'];
+  if (args.status !== undefined) sets.push(`status = ${lit(args.status)}`);
+  if (args.priority !== undefined) sets.push(`priority = ${lit(args.priority)}`);
+  if (args.title !== undefined) sets.push(`title = ${lit(args.title)}`);
+  if (args.body !== undefined) sets.push(`body = ${lit(args.body)}`);
+  if (links !== undefined) sets.push(`links = ${jsonbLit(links)}`);
+  if (dependsOn !== undefined) sets.push(`depends_on = ${textArray(dependsOn)}`);
+  if (args.branch !== undefined) sets.push(`branch = ${lit(args.branch)}`);
+  if (args['progress-note'] !== undefined) sets.push(`progress_note = ${lit(args['progress-note'])}`);
+  if (args['due-date'] !== undefined) sets.push(`due_date = ${lit(args['due-date'])}`);
+
+  // Reason fields: persist on matching status; clear when leaving via another status.
+  if (args.status === 'blocked') sets.push(`blocked_reason = ${lit(args['blocked-reason'])}`);
+  else if (args.status !== undefined) sets.push('blocked_reason = NULL');
+  else if (args['blocked-reason'] !== undefined) sets.push(`blocked_reason = ${lit(args['blocked-reason'])}`);
+  if (args.status === 'abandoned') sets.push(`abandoned_reason = ${lit(args['abandoned-reason'])}`);
+  else if (args.status !== undefined) sets.push('abandoned_reason = NULL');
+  else if (args['abandoned-reason'] !== undefined) sets.push(`abandoned_reason = ${lit(args['abandoned-reason'])}`);
+
+  if (args.status === 'done' && before.status !== 'done') sets.push('completed_at = now()');
+  else if (args.status !== undefined && args.status !== 'done') sets.push('completed_at = NULL');
+
+  const row = queryJson(`
+    WITH upd AS (
+      UPDATE backlog_items SET ${sets.join(', ')} WHERE id = ${lit(args.id)} RETURNING *
+    ),
+    aud AS (
+      ${auditInsertSql('backlog_items', 'upd.id', 'update', jsonbLit(before), 'row_to_json(upd)::jsonb', 'upd')}
+    )
+    SELECT row_to_json(upd) FROM upd`);
+  if (!row) fail(`conflict: ${args.id} disappeared between read and write — retry`);
+  return withConsoleUrl(row);
+}
+
+// --- main ----------------------------------------------------------------------
+const commands = {
+  'list-repos': { fn: cmdListRepos, flags: [] },
+  'create-repo': { fn: cmdCreateRepo, flags: ['slug', 'short-slug', 'display-name', 'default-branch', 'color'] },
+  'list-items': { fn: cmdListItems, flags: ['repo', 'workstream', 'status', 'type', 'priority', 'q', 'limit', 'offset'] },
+  'get-item': { fn: cmdGetItem, flags: ['id'] },
+  'summarize': { fn: cmdSummarize, flags: ['workstream', 'repo'] },
+  'create-item': { fn: cmdCreateItem, flags: ['repo', 'workstream', 'title', 'type', 'body', 'priority', 'source-context', 'depends-on', 'branch', 'progress-note', 'due-date', 'links', 'id'] },
+  'update-item': { fn: cmdUpdateItem, flags: ['id', 'status', 'priority', 'title', 'body', 'blocked-reason', 'abandoned-reason', 'depends-on', 'branch', 'progress-note', 'due-date', 'links'] },
+};
+const [cmd, ...rest] = process.argv.slice(2);
+if (!cmd || !commands[cmd]) {
+  fail(`usage: tools/backlog <${Object.keys(commands).join('|')}> [--flags] (see header comment)`);
+}
+const args = parseArgs(rest);
+for (const k of Object.keys(args)) {
+  if (!commands[cmd].flags.includes(k)) {
+    fail(`unknown flag --${k} for ${cmd} (allowed: ${commands[cmd].flags.map((f) => '--' + f).join(' ') || 'none'})`);
+  }
+}
+console.log(JSON.stringify(commands[cmd].fn(args), null, 2));

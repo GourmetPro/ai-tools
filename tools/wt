@@ -1,0 +1,121 @@
+#!/usr/bin/env zsh
+# wt - Launch a Claude session in an isolated worktree under .claude/worktrees/<name>.
+#
+# Install:
+#   ./install/wt
+#
+# Usage: wt <name> [--from <branch>] [--prompt "..."] [--tmux]
+
+main() {
+  emulate -L zsh
+  setopt err_return pipe_fail
+
+  local name=""
+  local from_branch="main"
+  local prompt=""
+  local tmux=0
+
+  while (( $# )); do
+    case "$1" in
+      --from)
+        from_branch="$2"
+        shift 2
+        ;;
+      --prompt)
+        prompt="$2"
+        shift 2
+        ;;
+      --tmux)
+        tmux=1
+        shift
+        ;;
+      -h|--help)
+        print -r -- "Usage: wt <name> [--from <branch>] [--prompt \"...\"] [--tmux]"
+        return 0
+        ;;
+      -*)
+        print -r -- "wt: unknown flag: $1" >&2
+        return 1
+        ;;
+      *)
+        if [[ -z "$name" ]]; then
+          name="$1"
+        else
+          print -r -- "wt: unexpected argument: $1" >&2
+          return 1
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  if [[ -z "$name" ]]; then
+    print -r -- "Usage: wt <name> [--from <branch>] [--prompt \"...\"] [--tmux]" >&2
+    return 1
+  fi
+
+  # Resolve main repo root (works from main repo or any worktree).
+  local git_common
+  git_common=$(git rev-parse --git-common-dir 2>/dev/null) || {
+    print -r -- "wt: not inside a git repo" >&2
+    return 1
+  }
+  # --git-common-dir returns a relative path when inside the main repo; make absolute.
+  if [[ "$git_common" != /* ]]; then
+    git_common="$PWD/$git_common"
+  fi
+  local repo_root
+  repo_root=$(cd "$git_common/.." && pwd -P)
+
+  local branch="worktree-${name}"
+  local wt_path="$repo_root/.claude/worktrees/$name"
+
+  # Worktree handling (idempotent).
+  if [[ -d "$wt_path" ]]; then
+    print -r -- "✓ Reusing worktree .claude/worktrees/$name (branch: $branch)"
+  elif git -C "$repo_root" show-ref --verify --quiet "refs/heads/$branch"; then
+    git -C "$repo_root" worktree add "$wt_path" "$branch" >/dev/null
+    print -r -- "✓ Attached worktree .claude/worktrees/$name to existing branch $branch"
+  else
+    git -C "$repo_root" worktree add -b "$branch" "$wt_path" "$from_branch" >/dev/null
+    print -r -- "✓ Created worktree .claude/worktrees/$name (branch: $branch, from: $from_branch)"
+  fi
+
+  # Symlink secrets / local settings from main repo.
+  local link src dst
+  for link in .env .env.production .env.local .claude/settings.local.json; do
+    src="$repo_root/$link"
+    dst="$wt_path/$link"
+    if [[ ! -e "$src" && ! -L "$src" ]]; then
+      print -r -- "- $link (no source, skipped)"
+      continue
+    fi
+    if [[ -e "$dst" || -L "$dst" ]]; then
+      print -r -- "- $link (target exists, skipped)"
+      continue
+    fi
+    mkdir -p "${dst:h}"
+    ln -s "$src" "$dst"
+    print -r -- "✓ Linked $link"
+  done
+
+  # Defensive tmp/ prep.
+  mkdir -p "$wt_path/tmp"
+  print -r -- "✓ tmp/ ready"
+
+  # Terminal tab title.
+  print -Pn "\e]0;cc:${name}\a"
+
+  # Launch claude from the worktree dir.
+  print -r -- "→ Launching claude (remote-control: $name)"
+  cd "$wt_path"
+
+  local -a claude_args
+  claude_args=(--remote-control "$name" --name "$name")
+  (( tmux )) && claude_args+=(--tmux)
+  [[ -n "$prompt" ]] && claude_args+=("$prompt")
+
+  command claude "${claude_args[@]}"
+}
+
+main "$@"
