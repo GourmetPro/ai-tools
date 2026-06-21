@@ -231,7 +231,7 @@ test_homebrew_wt_formula() {
   assert_file_exists "$formula" "wt Homebrew formula" || return 1
   assert_contains "class Wt < Formula" "$formula" "wt formula class" || return 1
   assert_contains 'url "https://github.com/GourmetPro/ai-tools.git",' "$formula" "wt formula GitHub source" || return 1
-  assert_contains 'tag:      "v0.1.0",' "$formula" "wt formula source tag" || return 1
+  assert_contains 'tag:      "v0.1.1",' "$formula" "wt formula source tag" || return 1
   assert_contains 'revision: "' "$formula" "wt formula source revision" || return 1
   assert_contains 'bin.install "tools/wt" => "wt"' "$formula" "wt formula installs executable" || return 1
   assert_contains 'depends_on "zsh"' "$formula" "wt formula zsh dependency" || return 1
@@ -247,7 +247,7 @@ test_homebrew_backlog_formula() {
   assert_file_exists "$formula" "backlog Homebrew formula" || return 1
   assert_contains "class Backlog < Formula" "$formula" "backlog formula class" || return 1
   assert_contains 'url "https://github.com/GourmetPro/ai-tools.git",' "$formula" "backlog formula GitHub source" || return 1
-  assert_contains 'tag:      "v0.1.0",' "$formula" "backlog formula source tag" || return 1
+  assert_contains 'tag:      "v0.1.1",' "$formula" "backlog formula source tag" || return 1
   assert_contains 'revision: "' "$formula" "backlog formula source revision" || return 1
   assert_contains 'libexec.install "tools/backlog" => "backlog"' "$formula" "backlog formula installs raw executable" || return 1
   assert_contains '(bin/"backlog").write' "$formula" "backlog formula writes command wrapper" || return 1
@@ -255,6 +255,7 @@ test_homebrew_backlog_formula() {
   assert_contains 'depends_on "node"' "$formula" "backlog formula node dependency" || return 1
   assert_contains 'depends_on "libpq"' "$formula" "backlog formula psql dependency" || return 1
   assert_contains 'ENV["BACKLOG_DATABASE_URL"] = "postgres://example.invalid/backlog"' "$formula" "backlog formula test config override" || return 1
+  assert_contains 'assert_match "Purpose:", shell_output("#{bin}/backlog --help")' "$formula" "backlog formula test uses help output" || return 1
   ruby -c "$formula" > /dev/null || {
     fail "backlog formula should be valid Ruby"
     return 1

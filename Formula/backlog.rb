@@ -2,9 +2,9 @@ class Backlog < Formula
   desc "Database-backed backlog CLI"
   homepage "https://github.com/GourmetPro/ai-tools"
   url "https://github.com/GourmetPro/ai-tools.git",
-      tag:      "v0.1.0",
-      revision: "fe71f4fb4f7817d3174d736d353256d9d91e692f"
-  version "0.1.0"
+      tag:      "v0.1.1",
+      revision: "512fa9fadc60b78c63bb0fe5e898c5d0c8159810"
+  version "0.1.1"
   depends_on "libpq"
   depends_on "node"
 
@@ -34,6 +34,6 @@ class Backlog < Formula
 
   test do
     ENV["BACKLOG_DATABASE_URL"] = "postgres://example.invalid/backlog"
-    assert_match "usage: tools/backlog", shell_output("#{bin}/backlog 2>&1", 2)
+    assert_match "Purpose:", shell_output("#{bin}/backlog --help")
   end
 end
