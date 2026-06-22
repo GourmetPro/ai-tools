@@ -271,7 +271,7 @@ test_homebrew_wt_formula() {
   assert_file_exists "$formula" "wt Homebrew formula" || return 1
   assert_contains "class Wt < Formula" "$formula" "wt formula class" || return 1
   assert_contains 'url "https://github.com/GourmetPro/ai-tools.git",' "$formula" "wt formula GitHub source" || return 1
-  assert_contains 'tag:      "v0.1.1",' "$formula" "wt formula source tag" || return 1
+  assert_contains 'tag:      "v0.2.0",' "$formula" "wt formula source tag" || return 1
   assert_contains 'revision: "' "$formula" "wt formula source revision" || return 1
   assert_contains 'bin.install "tools/wt" => "wt"' "$formula" "wt formula installs executable" || return 1
   assert_contains 'depends_on "zsh"' "$formula" "wt formula zsh dependency" || return 1
@@ -287,7 +287,7 @@ test_homebrew_backlog_formula() {
   assert_file_exists "$formula" "backlog Homebrew formula" || return 1
   assert_contains "class Backlog < Formula" "$formula" "backlog formula class" || return 1
   assert_contains 'url "https://github.com/GourmetPro/ai-tools.git",' "$formula" "backlog formula GitHub source" || return 1
-  assert_contains 'tag:      "v0.1.1",' "$formula" "backlog formula source tag" || return 1
+  assert_contains 'tag:      "v0.2.0",' "$formula" "backlog formula source tag" || return 1
   assert_contains 'revision: "' "$formula" "backlog formula source revision" || return 1
   assert_contains 'libexec.install "tools/backlog" => "backlog"' "$formula" "backlog formula installs raw executable" || return 1
   assert_contains '(bin/"backlog").write' "$formula" "backlog formula writes command wrapper" || return 1
@@ -364,8 +364,8 @@ test_bump_homebrew_release_script_bumps_semver_levels() {
     fail "minor bump should succeed; stderr was: $(<"$tmp/err")"
     return 1
   }
-  assert_contains 'tag:      "v0.2.0",' "$tmp/Formula/wt.rb" "minor bump tag" || return 1
-  assert_contains 'version "0.2.0"' "$tmp/Formula/backlog.rb" "minor bump version" || return 1
+  assert_contains 'tag:      "v0.3.0",' "$tmp/Formula/wt.rb" "minor bump tag" || return 1
+  assert_contains 'version "0.3.0"' "$tmp/Formula/backlog.rb" "minor bump version" || return 1
 
   (cd "$tmp" && scripts/bump-homebrew-release --major) > "$tmp/out2" 2> "$tmp/err2" || {
     fail "major bump should succeed; stderr was: $(<"$tmp/err2")"
