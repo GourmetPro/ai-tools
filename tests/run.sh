@@ -72,7 +72,47 @@ test_wt_runs_as_executable() {
     fail "tools/wt --help should exit 0; output was: $output"
     return 1
   }
-  assert_eq 'Usage: wt <name> [--from <branch>] [--prompt "..."] [--tmux]' "$output" "wt help output"
+  assert_eq 'Usage: wt <name> [--from <branch>] [--model <model>] [--prompt "..."] [--tmux]' "$output" "wt help output"
+}
+
+test_wt_passes_model_to_claude() {
+  local tmp="$1"
+  mkdir -p "$tmp/bin" "$tmp/repo"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'set -euo pipefail' \
+    'printf "%s\n" "$PWD" > "$CLAUDE_PWD_FILE"' \
+    'printf "%s\n" "$@" > "$CLAUDE_ARGS_FILE"' > "$tmp/bin/claude"
+  chmod +x "$tmp/bin/claude"
+
+  git -C "$tmp/repo" init -q -b main || {
+    fail "temp git init failed"
+    return 1
+  }
+  git -C "$tmp/repo" config user.email "test@example.invalid"
+  git -C "$tmp/repo" config user.name "Test Runner"
+  printf 'initial\n' > "$tmp/repo/README.md"
+  git -C "$tmp/repo" add README.md
+  git -C "$tmp/repo" commit -q -m initial || {
+    fail "temp git commit failed"
+    return 1
+  }
+
+  local args="$tmp/claude.args"
+  local pwd_file="$tmp/claude.pwd"
+  (
+    cd "$tmp/repo" &&
+      PATH="$tmp/bin:$PATH" CLAUDE_ARGS_FILE="$args" CLAUDE_PWD_FILE="$pwd_file" \
+        "$ROOT/tools/wt" feature --model opus --prompt "do work" --tmux
+  ) > "$tmp/out" 2> "$tmp/err" || {
+    fail "wt should accept --model and launch claude; stderr was: $(<"$tmp/err")"
+    return 1
+  }
+
+  local expected_args=$'--remote-control\nfeature\n--name\nfeature\n--model\nopus\n--tmux\ndo work'
+  local repo_physical
+  repo_physical="$(cd "$tmp/repo" && pwd -P)"
+  assert_eq "$expected_args" "$(<"$args")" "claude args include model" || return 1
+  assert_eq "$repo_physical/.claude/worktrees/feature" "$(<"$pwd_file")" "claude launched in worktree"
 }
 
 test_backlog_reads_database_url_from_config() {
@@ -189,7 +229,7 @@ test_wt_installs_separately() {
     fail "installed wt --help should exit 0; output was: $output"
     return 1
   }
-  assert_eq 'Usage: wt <name> [--from <branch>] [--prompt "..."] [--tmux]' "$output" "installed wt help output"
+  assert_eq 'Usage: wt <name> [--from <branch>] [--model <model>] [--prompt "..."] [--tmux]' "$output" "installed wt help output"
 }
 
 test_backlog_installs_separately_and_writes_config() {
@@ -336,6 +376,7 @@ test_bump_homebrew_release_script_bumps_semver_levels() {
 }
 
 run_test "wt runs as a standalone executable" test_wt_runs_as_executable
+run_test "wt passes model flag to claude" with_tmpdir test_wt_passes_model_to_claude
 run_test "backlog reads DATABASE_URL from editable config" with_tmpdir test_backlog_reads_database_url_from_config
 run_test "backlog explains missing config" with_tmpdir test_backlog_explains_missing_config
 run_test "backlog documents CLI usage for agents" with_tmpdir test_backlog_documents_cli_for_agents

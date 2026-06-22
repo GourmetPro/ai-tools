@@ -4,7 +4,7 @@
 # Install:
 #   ./install/wt
 #
-# Usage: wt <name> [--from <branch>] [--prompt "..."] [--tmux]
+# Usage: wt <name> [--from <branch>] [--model <model>] [--prompt "..."] [--tmux]
 
 main() {
   emulate -L zsh
@@ -12,6 +12,7 @@ main() {
 
   local name=""
   local from_branch="main"
+  local model=""
   local prompt=""
   local tmux=0
 
@@ -19,6 +20,10 @@ main() {
     case "$1" in
       --from)
         from_branch="$2"
+        shift 2
+        ;;
+      --model)
+        model="$2"
         shift 2
         ;;
       --prompt)
@@ -30,7 +35,7 @@ main() {
         shift
         ;;
       -h|--help)
-        print -r -- "Usage: wt <name> [--from <branch>] [--prompt \"...\"] [--tmux]"
+        print -r -- "Usage: wt <name> [--from <branch>] [--model <model>] [--prompt \"...\"] [--tmux]"
         return 0
         ;;
       -*)
@@ -50,7 +55,7 @@ main() {
   done
 
   if [[ -z "$name" ]]; then
-    print -r -- "Usage: wt <name> [--from <branch>] [--prompt \"...\"] [--tmux]" >&2
+    print -r -- "Usage: wt <name> [--from <branch>] [--model <model>] [--prompt \"...\"] [--tmux]" >&2
     return 1
   fi
 
@@ -112,6 +117,7 @@ main() {
 
   local -a claude_args
   claude_args=(--remote-control "$name" --name "$name")
+  [[ -n "$model" ]] && claude_args+=(--model "$model")
   (( tmux )) && claude_args+=(--tmux)
   [[ -n "$prompt" ]] && claude_args+=("$prompt")
 
