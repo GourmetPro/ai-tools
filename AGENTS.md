@@ -57,8 +57,9 @@ sh -n install/envrun
 sh -n install/backlog
 bash -n scripts/bump-homebrew-release
 ruby -c Formula/wt.rb
+ruby -c Formula/envrun.rb
 ruby -c Formula/backlog.rb
-brew style Formula/wt.rb Formula/backlog.rb
+brew style Formula/wt.rb Formula/envrun.rb Formula/backlog.rb
 git diff --check
 ```
 

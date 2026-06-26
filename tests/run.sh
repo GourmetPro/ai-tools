@@ -484,13 +484,47 @@ test_homebrew_backlog_formula() {
   }
 }
 
-test_bump_homebrew_release_script_updates_formulae_and_tag() {
+test_homebrew_envrun_formula() {
+  local formula="$ROOT/Formula/envrun.rb"
+  assert_file_exists "$formula" "envrun Homebrew formula" || return 1
+  assert_contains "class Envrun < Formula" "$formula" "envrun formula class" || return 1
+  assert_contains 'url "https://github.com/GourmetPro/ai-tools.git",' "$formula" "envrun formula GitHub source" || return 1
+  assert_formula_release_metadata "$formula" "envrun" || return 1
+  assert_contains 'bin.install "tools/envrun" => "envrun"' "$formula" "envrun formula installs executable" || return 1
+  assert_contains 'depends_on "git"' "$formula" "envrun formula git dependency" || return 1
+  assert_contains 'assert_match "Usage: envrun", shell_output("#{bin}/envrun --help")' "$formula" "envrun formula test uses help output" || return 1
+  ruby -c "$formula" > /dev/null || {
+    fail "envrun formula should be valid Ruby"
+    return 1
+  }
+}
+
+setup_release_helper_fixture() {
   local tmp="$1"
   mkdir -p "$tmp/Formula" "$tmp/scripts"
-  cp "$ROOT/Formula/wt.rb" "$tmp/Formula/wt.rb"
-  cp "$ROOT/Formula/backlog.rb" "$tmp/Formula/backlog.rb"
+  cp "$ROOT"/Formula/*.rb "$tmp/Formula/"
+  cp "$ROOT/Formula/envrun.rb" "$tmp/Formula/synthetic.rb"
   cp "$ROOT/scripts/bump-homebrew-release" "$tmp/scripts/bump-homebrew-release"
   chmod +x "$tmp/scripts/bump-homebrew-release"
+}
+
+assert_formulae_bumped_to_release() {
+  local formula_dir="$1"
+  local version="$2"
+  local revision="$3"
+  local formula name
+
+  for formula in "$formula_dir"/*.rb; do
+    name="$(basename "$formula" .rb)"
+    assert_contains "tag:      \"v$version\"," "$formula" "$name formula bumped tag" || return 1
+    assert_contains "revision: \"$revision\"" "$formula" "$name formula bumped revision" || return 1
+    assert_contains "version \"$version\"" "$formula" "$name formula bumped version" || return 1
+  done
+}
+
+test_bump_homebrew_release_script_updates_formulae_and_tag() {
+  local tmp="$1"
+  setup_release_helper_fixture "$tmp"
 
   git -C "$tmp" init -q || {
     fail "temp git init failed"
@@ -513,22 +547,13 @@ test_bump_homebrew_release_script_updates_formulae_and_tag() {
   }
 
   assert_eq "$revision" "$(git -C "$tmp" rev-parse v9.8.7^{commit})" "created release tag revision" || return 1
-  assert_contains 'tag:      "v9.8.7",' "$tmp/Formula/wt.rb" "wt formula bumped tag" || return 1
-  assert_contains "revision: \"$revision\"" "$tmp/Formula/wt.rb" "wt formula bumped revision" || return 1
-  assert_contains 'version "9.8.7"' "$tmp/Formula/wt.rb" "wt formula bumped version" || return 1
-  assert_contains 'tag:      "v9.8.7",' "$tmp/Formula/backlog.rb" "backlog formula bumped tag" || return 1
-  assert_contains "revision: \"$revision\"" "$tmp/Formula/backlog.rb" "backlog formula bumped revision" || return 1
-  assert_contains 'version "9.8.7"' "$tmp/Formula/backlog.rb" "backlog formula bumped version" || return 1
+  assert_formulae_bumped_to_release "$tmp/Formula" "9.8.7" "$revision" || return 1
   assert_contains "Updated Homebrew formulae to v9.8.7" "$tmp/out" "script success output" || return 1
 }
 
 test_bump_homebrew_release_script_bumps_semver_levels() {
   local tmp="$1"
-  mkdir -p "$tmp/Formula" "$tmp/scripts"
-  cp "$ROOT/Formula/wt.rb" "$tmp/Formula/wt.rb"
-  cp "$ROOT/Formula/backlog.rb" "$tmp/Formula/backlog.rb"
-  cp "$ROOT/scripts/bump-homebrew-release" "$tmp/scripts/bump-homebrew-release"
-  chmod +x "$tmp/scripts/bump-homebrew-release"
+  setup_release_helper_fixture "$tmp"
 
   git -C "$tmp" init -q || {
     fail "temp git init failed"
@@ -542,25 +567,24 @@ test_bump_homebrew_release_script_bumps_semver_levels() {
     return 1
   }
 
-  local current_version major minor patch expected_minor expected_major
+  local current_version major minor patch expected_minor expected_major revision
   current_version="$(formula_version "$tmp/Formula/wt.rb")"
   IFS=. read -r major minor patch <<< "$current_version"
   expected_minor="$major.$((minor + 1)).0"
   expected_major="$((major + 1)).0.0"
+  revision="$(git -C "$tmp" rev-parse HEAD)" || return 1
 
   (cd "$tmp" && scripts/bump-homebrew-release --minor) > "$tmp/out" 2> "$tmp/err" || {
     fail "minor bump should succeed; stderr was: $(<"$tmp/err")"
     return 1
   }
-  assert_contains "tag:      \"v$expected_minor\"," "$tmp/Formula/wt.rb" "minor bump tag" || return 1
-  assert_contains "version \"$expected_minor\"" "$tmp/Formula/backlog.rb" "minor bump version" || return 1
+  assert_formulae_bumped_to_release "$tmp/Formula" "$expected_minor" "$revision" || return 1
 
   (cd "$tmp" && scripts/bump-homebrew-release --major) > "$tmp/out2" 2> "$tmp/err2" || {
     fail "major bump should succeed; stderr was: $(<"$tmp/err2")"
     return 1
   }
-  assert_contains "tag:      \"v$expected_major\"," "$tmp/Formula/wt.rb" "major bump tag" || return 1
-  assert_contains "version \"$expected_major\"" "$tmp/Formula/backlog.rb" "major bump version" || return 1
+  assert_formulae_bumped_to_release "$tmp/Formula" "$expected_major" "$revision" || return 1
 }
 
 run_test "wt runs as a standalone executable" test_wt_runs_as_executable
@@ -579,6 +603,7 @@ run_test "envrun has its own installer" with_tmpdir test_envrun_installs_separat
 run_test "backlog has its own installer and config setup" with_tmpdir test_backlog_installs_separately_and_writes_config
 run_test "backlog installer creates skippable blank config template" with_tmpdir test_backlog_installer_creates_blank_config_template
 run_test "wt has a Homebrew formula" test_homebrew_wt_formula
+run_test "envrun has a Homebrew formula" test_homebrew_envrun_formula
 run_test "backlog has a Homebrew formula" test_homebrew_backlog_formula
 run_test "release helper bumps Homebrew formulae and tag" with_tmpdir test_bump_homebrew_release_script_updates_formulae_and_tag
 run_test "release helper supports SemVer bump levels" with_tmpdir test_bump_homebrew_release_script_bumps_semver_levels

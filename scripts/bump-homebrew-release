@@ -112,7 +112,8 @@ else
   git tag "$tag" "$revision"
 fi
 
-formulae=(Formula/wt.rb Formula/backlog.rb)
+formulae=(Formula/*.rb)
+[[ "${formulae[0]}" != "Formula/*.rb" ]] || die "no formulae found in Formula"
 for formula in "${formulae[@]}"; do
   [[ -f "$formula" ]] || die "missing formula: $formula"
 done

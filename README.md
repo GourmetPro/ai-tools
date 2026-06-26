@@ -16,12 +16,14 @@ instead of `homebrew-ai-tools`, use the explicit URL form:
 ```sh
 brew tap GourmetPro/ai-tools https://github.com/GourmetPro/ai-tools.git
 brew install GourmetPro/ai-tools/wt
+brew install GourmetPro/ai-tools/envrun
 brew install GourmetPro/ai-tools/backlog
 ```
 
 The formulae live in:
 
 - `Formula/wt.rb`
+- `Formula/envrun.rb`
 - `Formula/backlog.rb`
 
 `backlog` uses `~/.config/ai-tools/backlog.conf` by default after Homebrew
