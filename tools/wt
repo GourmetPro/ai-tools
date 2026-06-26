@@ -86,9 +86,9 @@ main() {
     print -r -- "✓ Created worktree .claude/worktrees/$name (branch: $branch, from: $from_branch)"
   fi
 
-  # Symlink secrets / local settings from main repo.
+  # Sync secrets / local settings from main repo.
   local link src dst
-  for link in .env .env.production .env.local .claude/settings.local.json; do
+  for link in .env .env.production .claude/settings.local.json; do
     src="$repo_root/$link"
     dst="$wt_path/$link"
     if [[ ! -e "$src" && ! -L "$src" ]]; then
@@ -103,6 +103,18 @@ main() {
     ln -s "$src" "$dst"
     print -r -- "✓ Linked $link"
   done
+
+  link=.env.local
+  src="$repo_root/$link"
+  dst="$wt_path/$link"
+  if [[ ! -e "$src" ]]; then
+    print -r -- "- $link (no source, skipped)"
+  elif [[ -e "$dst" || -L "$dst" ]]; then
+    print -r -- "- $link (target exists, skipped)"
+  else
+    cp -p "$src" "$dst"
+    print -r -- "✓ Copied $link"
+  fi
 
   # Defensive tmp/ prep.
   mkdir -p "$wt_path/tmp"

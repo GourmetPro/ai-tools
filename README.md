@@ -5,6 +5,7 @@ Portable command-line tools and Homebrew formulae for humans and agents.
 ## Tools
 
 - `wt`: launch a Claude session in an isolated Git worktree.
+- `envrun`: run a command with local `.env` / `.env.local` files exported.
 - `backlog`: query and mutate the GourmetPro backlog database from a terminal.
 
 ## Install With Homebrew
@@ -46,11 +47,22 @@ Install each tool independently:
 
 ```sh
 ./install/wt
+./install/envrun
 ./install/backlog
 ```
 
-Both installers symlink into `$AI_TOOLS_BIN_DIR` or `~/.local/bin` by default.
+These installers symlink into `$AI_TOOLS_BIN_DIR` or `~/.local/bin` by default.
 Use `--bin-dir /some/path` to install somewhere else.
+
+Use `envrun` when a raw executable needs variables from the repo's local env
+files:
+
+```sh
+envrun -c 'psql "$POSTGRES_URL" -Atc "select 1"'
+envrun --test -c 'psql "$POSTGRES_URL" -Atc "select 1"'
+envrun --production -- node scripts/smoke-check.js
+envrun -- node scripts/example.js
+```
 
 `install/backlog` prompts for `DATABASE_URL` when it creates a new config. Press
 Enter to skip; it will still create a template with `DATABASE_URL=` and the

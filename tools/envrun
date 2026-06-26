@@ -1,0 +1,117 @@
+#!/usr/bin/env sh
+# envrun - Run a command with local .env files exported.
+#
+# Install:
+#   ./install/envrun
+#
+# Usage:
+#   envrun -- COMMAND [ARG...]
+#   envrun --test -- COMMAND [ARG...]
+#   envrun --production -c 'COMMAND STRING'
+#   envrun -c 'COMMAND STRING'
+
+set -eu
+
+usage() {
+  cat <<'EOF'
+Usage: envrun [--test|--production] [-c COMMAND | -- COMMAND [ARG...]]
+
+Loads .env then .env.local from the Git worktree root, or the current
+directory outside Git, exports those variables, then runs COMMAND. With
+--test or --production, also loads .env.test or .env.production last.
+
+Use -c when the command string itself references loaded variables:
+  envrun -c 'psql "$POSTGRES_URL" -Atc "select 1"'
+
+Use direct execution when the child process reads environment variables:
+  envrun -- node scripts/example.js
+EOF
+}
+
+die() {
+  printf 'envrun: %s\n' "$1" >&2
+  exit 2
+}
+
+find_env_root() {
+  git_root=""
+  if command -v git >/dev/null 2>&1; then
+    git_root="$(git rev-parse --show-toplevel 2>/dev/null || :)"
+  fi
+  if [ -n "$git_root" ]; then
+    printf '%s\n' "$git_root"
+  else
+    pwd -P
+  fi
+}
+
+load_env_file() {
+  env_file="$1"
+  [ -f "$env_file" ] || return 0
+  set -a
+  . "$env_file"
+  set +a
+}
+
+if [ "$#" -eq 0 ]; then
+  usage >&2
+  exit 2
+fi
+
+mode=exec
+command_string=""
+env_mode=""
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --test)
+      [ -z "$env_mode" ] || die 'choose only one of --test or --production'
+      env_mode=test
+      shift
+      ;;
+    --production)
+      [ -z "$env_mode" ] || die 'choose only one of --test or --production'
+      env_mode=production
+      shift
+      ;;
+    -c|--command)
+      shift
+      [ "$#" -ge 1 ] || die '-c requires a command string'
+      command_string="$1"
+      shift
+      [ "$#" -eq 0 ] || die '-c accepts exactly one command string'
+      mode=shell
+      break
+      ;;
+    --)
+      shift
+      [ "$#" -ge 1 ] || die '-- must be followed by a command'
+      break
+      ;;
+    -*)
+      die "unknown option: $1"
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+[ "$mode" = shell ] || [ "$#" -ge 1 ] || die 'missing command'
+
+env_root="$(find_env_root)"
+load_env_file "$env_root/.env"
+load_env_file "$env_root/.env.local"
+if [ -n "$env_mode" ]; then
+  load_env_file "$env_root/.env.$env_mode"
+fi
+
+if [ "$mode" = shell ]; then
+  exec "${SHELL:-/bin/sh}" -c "$command_string"
+fi
+
+exec "$@"

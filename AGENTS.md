@@ -50,8 +50,10 @@ Before committing or pushing changes, run:
 ```sh
 bash tests/run.sh
 zsh -n tools/wt
+sh -n tools/envrun
 node --check tools/backlog
 sh -n install/wt
+sh -n install/envrun
 sh -n install/backlog
 bash -n scripts/bump-homebrew-release
 ruby -c Formula/wt.rb

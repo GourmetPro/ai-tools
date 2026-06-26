@@ -14,7 +14,7 @@ class Backlog < Formula
 
     (bin/"backlog").write <<~SH
       #!/bin/sh
-      export PATH="#{Formula["libpq"].opt_bin}:#{Formula["node"].opt_bin}:$PATH"
+      export PATH="#{formula_opt_bin("libpq")}:#{formula_opt_bin("node")}:$PATH"
       exec "#{libexec}/backlog" "$@"
     SH
   end

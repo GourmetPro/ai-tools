@@ -115,6 +115,150 @@ test_wt_passes_model_to_claude() {
   assert_eq "$repo_physical/.claude/worktrees/feature" "$(<"$pwd_file")" "claude launched in worktree"
 }
 
+test_wt_copies_env_local() {
+  local tmp="$1"
+  mkdir -p "$tmp/bin" "$tmp/repo"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'set -euo pipefail' > "$tmp/bin/claude"
+  chmod +x "$tmp/bin/claude"
+
+  git -C "$tmp/repo" init -q -b main || {
+    fail "temp git init failed"
+    return 1
+  }
+  git -C "$tmp/repo" config user.email "test@example.invalid"
+  git -C "$tmp/repo" config user.name "Test Runner"
+  printf 'initial\n' > "$tmp/repo/README.md"
+  git -C "$tmp/repo" add README.md
+  git -C "$tmp/repo" commit -q -m initial || {
+    fail "temp git commit failed"
+    return 1
+  }
+
+  printf 'SHARED=linked\n' > "$tmp/repo/.env"
+  printf 'LOCAL=copied\n' > "$tmp/repo/.env.local"
+
+  (
+    cd "$tmp/repo" &&
+      PATH="$tmp/bin:$PATH" "$ROOT/tools/wt" feature
+  ) > "$tmp/out" 2> "$tmp/err" || {
+    fail "wt should launch claude after preparing env files; stderr was: $(<"$tmp/err")"
+    return 1
+  }
+
+  local worktree_env="$tmp/repo/.claude/worktrees/feature/.env"
+  local worktree_env_local="$tmp/repo/.claude/worktrees/feature/.env.local"
+  [[ -L "$worktree_env" ]] || {
+    fail "wt should still symlink .env"
+    return 1
+  }
+  [[ -f "$worktree_env_local" && ! -L "$worktree_env_local" ]] || {
+    fail "wt should copy .env.local as a regular file"
+    return 1
+  }
+  assert_eq 'LOCAL=copied' "$(<"$worktree_env_local")" "copied .env.local contents" || return 1
+}
+
+test_envrun_runs_as_executable() {
+  local output
+  output="$("$ROOT/tools/envrun" --help 2>&1)" || {
+    fail "tools/envrun --help should exit 0; output was: $output"
+    return 1
+  }
+  assert_contains 'Usage: envrun [--test|--production] [-c COMMAND | -- COMMAND [ARG...]]' <(printf '%s\n' "$output") "envrun help output"
+}
+
+test_envrun_loads_local_env_files_from_git_root() {
+  local tmp="$1"
+  mkdir -p "$tmp/repo/subdir"
+
+  git -C "$tmp/repo" init -q -b main || {
+    fail "temp git init failed"
+    return 1
+  }
+  git -C "$tmp/repo" config user.email "test@example.invalid"
+  git -C "$tmp/repo" config user.name "Test Runner"
+  printf 'initial\n' > "$tmp/repo/README.md"
+  git -C "$tmp/repo" add README.md
+  git -C "$tmp/repo" commit -q -m initial || {
+    fail "temp git commit failed"
+    return 1
+  }
+
+  printf '%s\n' \
+    'SHARED=from-env' \
+    'OVERRIDE=from-env' > "$tmp/repo/.env"
+  printf '%s\n' \
+    'LOCAL_ONLY=from-local' \
+    'OVERRIDE=from-local' > "$tmp/repo/.env.local"
+
+  (
+    cd "$tmp/repo/subdir" &&
+      "$ROOT/tools/envrun" sh -c 'printf "%s|%s|%s\n" "$SHARED" "$LOCAL_ONLY" "$OVERRIDE"'
+  ) > "$tmp/out" 2> "$tmp/err" || {
+    fail "envrun should load repo-root .env files; stderr was: $(<"$tmp/err")"
+    return 1
+  }
+
+  assert_eq 'from-env|from-local|from-local' "$(<"$tmp/out")" "envrun exported env values"
+}
+
+test_envrun_shell_command_expands_loaded_env() {
+  local tmp="$1"
+  mkdir -p "$tmp/repo"
+  printf 'POSTGRES_URL=postgres://local.example/test\n' > "$tmp/repo/.env.local"
+
+  (
+    cd "$tmp/repo" &&
+      "$ROOT/tools/envrun" -c 'printf "%s\n" "$POSTGRES_URL"'
+  ) > "$tmp/out" 2> "$tmp/err" || {
+    fail "envrun -c should execute after loading .env.local; stderr was: $(<"$tmp/err")"
+    return 1
+  }
+
+  assert_eq 'postgres://local.example/test' "$(<"$tmp/out")" "envrun -c expands loaded env"
+}
+
+test_envrun_test_flag_loads_test_env() {
+  local tmp="$1"
+  mkdir -p "$tmp/repo"
+  printf 'DATABASE_URL=postgres://base.example/app\n' > "$tmp/repo/.env"
+  printf 'DATABASE_URL=postgres://local.example/app\n' > "$tmp/repo/.env.local"
+  printf '%s\n' \
+    'DATABASE_URL=postgres://test.example/app' \
+    'TEST_ONLY=enabled' > "$tmp/repo/.env.test"
+
+  (
+    cd "$tmp/repo" &&
+      "$ROOT/tools/envrun" --test -c 'printf "%s|%s\n" "$DATABASE_URL" "$TEST_ONLY"'
+  ) > "$tmp/out" 2> "$tmp/err" || {
+    fail "envrun --test should load .env.test; stderr was: $(<"$tmp/err")"
+    return 1
+  }
+
+  assert_eq 'postgres://test.example/app|enabled' "$(<"$tmp/out")" "envrun --test env values"
+}
+
+test_envrun_production_flag_loads_production_env() {
+  local tmp="$1"
+  mkdir -p "$tmp/repo"
+  printf 'DATABASE_URL=postgres://base.example/app\n' > "$tmp/repo/.env"
+  printf 'DATABASE_URL=postgres://local.example/app\n' > "$tmp/repo/.env.local"
+  printf '%s\n' \
+    'DATABASE_URL=postgres://production.example/app' \
+    'PRODUCTION_ONLY=enabled' > "$tmp/repo/.env.production"
+
+  (
+    cd "$tmp/repo" &&
+      "$ROOT/tools/envrun" --production -c 'printf "%s|%s\n" "$DATABASE_URL" "$PRODUCTION_ONLY"'
+  ) > "$tmp/out" 2> "$tmp/err" || {
+    fail "envrun --production should load .env.production; stderr was: $(<"$tmp/err")"
+    return 1
+  }
+
+  assert_eq 'postgres://production.example/app|enabled' "$(<"$tmp/out")" "envrun --production env values"
+}
+
 test_backlog_reads_database_url_from_config() {
   local tmp="$1"
   mkdir -p "$tmp/bin"
@@ -232,6 +376,24 @@ test_wt_installs_separately() {
   assert_eq 'Usage: wt <name> [--from <branch>] [--model <model>] [--prompt "..."] [--tmux]' "$output" "installed wt help output"
 }
 
+test_envrun_installs_separately() {
+  local tmp="$1"
+  "$ROOT/install/envrun" --bin-dir "$tmp/bin" > "$tmp/out" 2> "$tmp/err" || {
+    fail "install/envrun should succeed; stderr was: $(<"$tmp/err")"
+    return 1
+  }
+  [[ -L "$tmp/bin/envrun" ]] || {
+    fail "install/envrun should create an envrun symlink"
+    return 1
+  }
+  local output
+  output="$("$tmp/bin/envrun" --help 2>&1)" || {
+    fail "installed envrun --help should exit 0; output was: $output"
+    return 1
+  }
+  assert_contains 'Usage: envrun [--test|--production] [-c COMMAND | -- COMMAND [ARG...]]' <(printf '%s\n' "$output") "installed envrun help output"
+}
+
 test_backlog_installs_separately_and_writes_config() {
   local tmp="$1"
   "$ROOT/install/backlog" \
@@ -291,7 +453,8 @@ test_homebrew_backlog_formula() {
   assert_contains 'revision: "' "$formula" "backlog formula source revision" || return 1
   assert_contains 'libexec.install "tools/backlog" => "backlog"' "$formula" "backlog formula installs raw executable" || return 1
   assert_contains '(bin/"backlog").write' "$formula" "backlog formula writes command wrapper" || return 1
-  assert_contains 'Formula["libpq"].opt_bin' "$formula" "backlog formula wrapper includes psql path" || return 1
+  assert_contains 'formula_opt_bin("libpq")' "$formula" "backlog formula wrapper includes psql path" || return 1
+  assert_contains 'formula_opt_bin("node")' "$formula" "backlog formula wrapper includes node path" || return 1
   assert_contains 'depends_on "node"' "$formula" "backlog formula node dependency" || return 1
   assert_contains 'depends_on "libpq"' "$formula" "backlog formula psql dependency" || return 1
   assert_contains 'ENV["BACKLOG_DATABASE_URL"] = "postgres://example.invalid/backlog"' "$formula" "backlog formula test config override" || return 1
@@ -377,10 +540,17 @@ test_bump_homebrew_release_script_bumps_semver_levels() {
 
 run_test "wt runs as a standalone executable" test_wt_runs_as_executable
 run_test "wt passes model flag to claude" with_tmpdir test_wt_passes_model_to_claude
+run_test "wt copies .env.local into worktrees" with_tmpdir test_wt_copies_env_local
+run_test "envrun runs as a standalone executable" test_envrun_runs_as_executable
+run_test "envrun loads local env files from the Git root" with_tmpdir test_envrun_loads_local_env_files_from_git_root
+run_test "envrun shell mode expands loaded env values" with_tmpdir test_envrun_shell_command_expands_loaded_env
+run_test "envrun test flag loads .env.test" with_tmpdir test_envrun_test_flag_loads_test_env
+run_test "envrun production flag loads .env.production" with_tmpdir test_envrun_production_flag_loads_production_env
 run_test "backlog reads DATABASE_URL from editable config" with_tmpdir test_backlog_reads_database_url_from_config
 run_test "backlog explains missing config" with_tmpdir test_backlog_explains_missing_config
 run_test "backlog documents CLI usage for agents" with_tmpdir test_backlog_documents_cli_for_agents
 run_test "wt has its own installer" with_tmpdir test_wt_installs_separately
+run_test "envrun has its own installer" with_tmpdir test_envrun_installs_separately
 run_test "backlog has its own installer and config setup" with_tmpdir test_backlog_installs_separately_and_writes_config
 run_test "backlog installer creates skippable blank config template" with_tmpdir test_backlog_installer_creates_blank_config_template
 run_test "wt has a Homebrew formula" test_homebrew_wt_formula
