@@ -45,6 +45,27 @@ assert_file_exists() {
   fi
 }
 
+formula_version() {
+  local formula="$1"
+  sed -nE 's/^[[:space:]]*version "([0-9]+[.][0-9]+[.][0-9]+)".*/\1/p' "$formula" | head -n 1
+}
+
+assert_formula_release_metadata() {
+  local formula="$1"
+  local name="$2"
+  local version
+  version="$(formula_version "$formula")"
+  if [[ ! "$version" =~ ^[0-9]+[.][0-9]+[.][0-9]+$ ]]; then
+    fail "$name formula version should be SemVer; got [$version]"
+    return 1
+  fi
+  assert_contains "tag:      \"v$version\"," "$formula" "$name formula tag matches version" || return 1
+  if ! grep -Eq 'revision: "[0-9a-f]{40}"' "$formula"; then
+    fail "$name formula revision should be a 40-character Git SHA"
+    return 1
+  fi
+}
+
 with_tmpdir() {
   local fn="$1"
   local tmp
@@ -433,8 +454,7 @@ test_homebrew_wt_formula() {
   assert_file_exists "$formula" "wt Homebrew formula" || return 1
   assert_contains "class Wt < Formula" "$formula" "wt formula class" || return 1
   assert_contains 'url "https://github.com/GourmetPro/ai-tools.git",' "$formula" "wt formula GitHub source" || return 1
-  assert_contains 'tag:      "v0.2.0",' "$formula" "wt formula source tag" || return 1
-  assert_contains 'revision: "' "$formula" "wt formula source revision" || return 1
+  assert_formula_release_metadata "$formula" "wt" || return 1
   assert_contains 'bin.install "tools/wt" => "wt"' "$formula" "wt formula installs executable" || return 1
   assert_contains 'depends_on "zsh"' "$formula" "wt formula zsh dependency" || return 1
   assert_contains 'system "#{bin}/wt", "--help"' "$formula" "wt formula test block" || return 1
@@ -449,8 +469,7 @@ test_homebrew_backlog_formula() {
   assert_file_exists "$formula" "backlog Homebrew formula" || return 1
   assert_contains "class Backlog < Formula" "$formula" "backlog formula class" || return 1
   assert_contains 'url "https://github.com/GourmetPro/ai-tools.git",' "$formula" "backlog formula GitHub source" || return 1
-  assert_contains 'tag:      "v0.2.0",' "$formula" "backlog formula source tag" || return 1
-  assert_contains 'revision: "' "$formula" "backlog formula source revision" || return 1
+  assert_formula_release_metadata "$formula" "backlog" || return 1
   assert_contains 'libexec.install "tools/backlog" => "backlog"' "$formula" "backlog formula installs raw executable" || return 1
   assert_contains '(bin/"backlog").write' "$formula" "backlog formula writes command wrapper" || return 1
   assert_contains 'formula_opt_bin("libpq")' "$formula" "backlog formula wrapper includes psql path" || return 1
@@ -523,19 +542,25 @@ test_bump_homebrew_release_script_bumps_semver_levels() {
     return 1
   }
 
+  local current_version major minor patch expected_minor expected_major
+  current_version="$(formula_version "$tmp/Formula/wt.rb")"
+  IFS=. read -r major minor patch <<< "$current_version"
+  expected_minor="$major.$((minor + 1)).0"
+  expected_major="$((major + 1)).0.0"
+
   (cd "$tmp" && scripts/bump-homebrew-release --minor) > "$tmp/out" 2> "$tmp/err" || {
     fail "minor bump should succeed; stderr was: $(<"$tmp/err")"
     return 1
   }
-  assert_contains 'tag:      "v0.3.0",' "$tmp/Formula/wt.rb" "minor bump tag" || return 1
-  assert_contains 'version "0.3.0"' "$tmp/Formula/backlog.rb" "minor bump version" || return 1
+  assert_contains "tag:      \"v$expected_minor\"," "$tmp/Formula/wt.rb" "minor bump tag" || return 1
+  assert_contains "version \"$expected_minor\"" "$tmp/Formula/backlog.rb" "minor bump version" || return 1
 
   (cd "$tmp" && scripts/bump-homebrew-release --major) > "$tmp/out2" 2> "$tmp/err2" || {
     fail "major bump should succeed; stderr was: $(<"$tmp/err2")"
     return 1
   }
-  assert_contains 'tag:      "v1.0.0",' "$tmp/Formula/wt.rb" "major bump tag" || return 1
-  assert_contains 'version "1.0.0"' "$tmp/Formula/backlog.rb" "major bump version" || return 1
+  assert_contains "tag:      \"v$expected_major\"," "$tmp/Formula/wt.rb" "major bump tag" || return 1
+  assert_contains "version \"$expected_major\"" "$tmp/Formula/backlog.rb" "major bump version" || return 1
 }
 
 run_test "wt runs as a standalone executable" test_wt_runs_as_executable
