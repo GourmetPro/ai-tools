@@ -1,0 +1,53 @@
+# Environment
+.env
+.env.production
+*.local
+
+# Dependencies & build
+node_modules/
+dist/
+.output/
+
+# Claude Code — user-specific settings (project settings.json is committed)
+.claude/settings.local.json
+
+# Raw data dumps from scripts — may contain contact/company PII.
+# Ignore directory CONTENTS but keep the directory itself so fresh checkouts
+# (incl. remote CCR agent clones) have `tmp/` available without a mkdir step.
+# Note: `tmp/` would exclude the whole directory and shadow the !tmp/.keep
+# rule — git can't re-include a file under a fully-ignored directory.
+tmp/*
+!tmp/.keep
+
+# Module-local scratch (wiki-hubspot smoke tests / registry cache run from the module dir).
+code/wiki-lib-hubspot/tmp/
+code/wiki-ops-digests/tmp/
+
+# Test fixture dotenv files — must be tracked despite the top-level .env* ignore rule.
+!code/wiki-ops-digests/tests/fixtures/env/.env
+!code/wiki-ops-digests/tests/fixtures/env/.env.production
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+
+# Editor swap / backup files
+*.swp
+*.swo
+*~
+
+# Vercel
+.vercel
+
+# Playwright MCP scratch artifacts
+.playwright-mcp/
+
+# Brainstorming session artifacts (mockups + state, persistent per session)
+.superpowers/
+
+# Git worktrees
+.worktrees/
+.claude/worktrees/
+.claire/worktrees/
