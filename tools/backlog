@@ -133,6 +133,49 @@ function selectBackendConfig(globals) {
   return { name: 'legacy-postgres', type: 'postgres', databaseUrl: dbUrl, configFile: loaded.file };
 }
 
+function listBackendConfigs() {
+  const loaded = loadBacklogConfig();
+  if (loaded.kind === 'legacy') {
+    const envUrl = process.env.BACKLOG_DATABASE_URL;
+    const fileUrl = loaded.config.DATABASE_URL;
+    return [{
+      name: 'legacy-postgres',
+      type: 'postgres',
+      default: true,
+      config_file: loaded.file,
+      has_database_url: Boolean(envUrl || fileUrl),
+      database_url_env: 'BACKLOG_DATABASE_URL',
+      database_url_env_set: Boolean(envUrl),
+      has_token: false,
+      token_env: null,
+      token_env_set: false,
+    }];
+  }
+
+  const backends = loaded.config.backends;
+  if (!Array.isArray(backends) || !backends.length) {
+    fail(`backlog JSON config ${loaded.file} must contain a non-empty "backends" array`);
+  }
+  const defaultName = loaded.config.default || backends[0].name;
+  return backends.map((backend) => {
+    if (!backend || typeof backend !== 'object') fail(`backend in ${loaded.file} must be an object`);
+    if (!backend.name) fail(`backend in ${loaded.file} is missing "name"`);
+    if (!backend.type) fail(`backend ${backend.name} in ${loaded.file} is missing "type"`);
+    return {
+      name: backend.name,
+      type: backend.type,
+      default: backend.name === defaultName,
+      config_file: loaded.file,
+      has_database_url: Boolean(backend.databaseUrl),
+      database_url_env: backend.databaseUrlEnv || null,
+      database_url_env_set: backend.databaseUrlEnv ? process.env[backend.databaseUrlEnv] !== undefined : false,
+      has_token: Boolean(backend.token),
+      token_env: backend.tokenEnv || null,
+      token_env_set: backend.tokenEnv ? process.env[backend.tokenEnv] !== undefined : false,
+    };
+  });
+}
+
 function normalizeBackend(backend, configFile) {
   if (!backend.name) fail(`backend in ${configFile} is missing "name"`);
   if (!backend.type) fail(`backend ${backend.name} in ${configFile} is missing "type"`);
@@ -1206,6 +1249,22 @@ const adapters = new Map([
 
 // --- help --------------------------------------------------------------------
 const commandDocs = {
+  'list-backends': `
+Usage: backlog list-backends
+
+Purpose:
+  Lists configured backend names, types, defaults, and whether secret-bearing
+  values are present. Secret values are never printed.
+
+Flags:
+  none
+
+Output:
+  JSON array of backend config rows.
+
+Examples:
+  backlog list-backends
+`,
   'list-repos': `
 Usage: backlog list-repos
 
@@ -1380,6 +1439,8 @@ Purpose:
   Issues backends.
 
 Commands:
+  list-backends
+      Show configured backend names and redacted credential sources.
   list-repos
       Show repositories available to the selected backend.
   create-repo --slug <org/repo> --short-slug <short> --display-name <name>
@@ -1449,7 +1510,7 @@ Try: backlog help <command>
 `.trim();
 
 function allCommands() {
-  return new Set([...Object.keys(postgresAdapter.commands), ...Object.keys(githubAdapter.commands)]);
+  return new Set(['list-backends', ...Object.keys(postgresAdapter.commands), ...Object.keys(githubAdapter.commands)]);
 }
 
 function helpTextFor(command) {
@@ -1508,6 +1569,13 @@ async function main() {
   if (!commands.has(cmd)) printUsageError(`unknown command: ${cmd}`);
   if (rest.includes('-h') || rest.includes('--help')) {
     printHelp(cmd);
+    return;
+  }
+  if (cmd === 'list-backends') {
+    const args = parseArgs(rest);
+    const keys = Object.keys(args);
+    if (keys.length) fail('list-backends does not accept flags');
+    console.log(JSON.stringify(listBackendConfigs(), null, 2));
     return;
   }
 

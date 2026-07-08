@@ -57,6 +57,26 @@ put a `"token": "..."` value directly in your private `backlog.json` so the
 backend does not need a token environment variable. Keep that file mode `0600`
 and do not commit it.
 
+List configured backend names without printing secrets:
+
+```sh
+backlog list-backends
+```
+
+## Backlog Migration
+
+Migrate open Postgres backlog items to GitHub Issues with:
+
+```sh
+scripts/migrate-postgres-backlog-to-github
+scripts/migrate-postgres-backlog-to-github --execute
+```
+
+The script migrates `queued`, `in_progress`, and `blocked` items by default.
+Dry-run is the default; `--execute` performs writes. It preserves title, body,
+priority, status, type, links, due date, branch/progress metadata, source
+context, and dependencies when the dependency targets have also been migrated.
+
 ## Install Without Homebrew
 
 Install each tool independently:

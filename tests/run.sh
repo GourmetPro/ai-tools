@@ -423,6 +423,35 @@ JSON
   assert_eq 'postgres://env.example/backlog' "$(head -n 1 "$tmp/psql.args")" "DATABASE_URL env override"
 }
 
+test_backlog_list_backends_redacts_configured_secrets() {
+  local tmp="$1"
+  mkdir -p "$tmp/config"
+  cat > "$tmp/config/backlog.json" <<'JSON'
+{
+  "default": "gh",
+  "backends": [
+    { "name": "pg", "type": "postgres", "databaseUrl": "postgres://secret.example/backlog" },
+    { "name": "gh", "type": "github-issues", "token": "secret-token" }
+  ]
+}
+JSON
+
+  BACKLOG_CONFIG="$tmp/config/backlog.json" "$ROOT/tools/backlog" list-backends > "$tmp/out" 2> "$tmp/err" || {
+    fail "backlog list-backends should succeed; stderr was: $(<"$tmp/err")"
+    return 1
+  }
+
+  assert_contains '"name": "pg"' "$tmp/out" "postgres backend listed" || return 1
+  assert_contains '"has_database_url": true' "$tmp/out" "database URL presence listed" || return 1
+  assert_contains '"name": "gh"' "$tmp/out" "github backend listed" || return 1
+  assert_contains '"default": true' "$tmp/out" "default backend listed" || return 1
+  assert_contains '"has_token": true' "$tmp/out" "token presence listed" || return 1
+  if grep -Fq 'secret.example' "$tmp/out" || grep -Fq 'secret-token' "$tmp/out"; then
+    fail "list-backends must not print secret values"
+    return 1
+  fi
+}
+
 start_fake_github() {
   local tmp="$1"
   local script="$tmp/fake-github.js"
@@ -953,7 +982,7 @@ test_backlog_documents_cli_for_agents() {
   assert_contains "AI workflow:" "$tmp/help.out" "help includes AI workflow" || return 1
   assert_contains "links JSON:" "$tmp/help.out" "help documents links JSON" || return 1
 
-  local commands=(list-repos create-repo list-items get-item summarize create-item update-item)
+  local commands=(list-backends list-repos create-repo list-items get-item summarize create-item update-item)
   local command
   for command in "${commands[@]}"; do
     BACKLOG_CONFIG="$tmp/missing.conf" BACKLOG_DATABASE_URL= "$ROOT/tools/backlog" "$command" --help > "$tmp/$command.help.out" 2> "$tmp/$command.help.err" || {
@@ -1001,6 +1030,191 @@ test_backlog_documents_cli_for_agents() {
     fail "bare backlog should not refer to source header comments"
     return 1
   fi
+}
+
+write_fake_backlog_for_migration() {
+  local fake="$1"
+  cat > "$fake" <<'JS'
+#!/usr/bin/env node
+const fs = require('fs');
+
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.FAKE_BACKLOG_LOG, `${JSON.stringify(args)}\n`);
+
+function valueAfter(flag) {
+  const idx = args.indexOf(flag);
+  return idx === -1 ? null : args[idx + 1];
+}
+
+function commandName() {
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--backend') {
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--')) {
+      i++;
+      continue;
+    }
+    return arg;
+  }
+  return null;
+}
+
+function sourceRows() {
+  return [
+    {
+      id: 'ai-tools--tooling--existing',
+      repo: 'GourmetPro/ai-tools',
+      workstream: 'tooling',
+      title: 'Existing item',
+      type: 'engineering',
+      body: 'Existing body',
+      status: 'queued',
+      priority: 'p2',
+      blocked_reason: null,
+      abandoned_reason: null,
+      links: [],
+      source_context: 'Original context',
+      depends_on: [],
+      branch: null,
+      progress_note: null,
+      due_date: null,
+      console_url: 'https://gtm.gourmetpro.co/work/backlog/ai-tools--tooling--existing'
+    },
+    {
+      id: 'ai-tools--tooling--new',
+      repo: 'GourmetPro/ai-tools',
+      workstream: 'tooling',
+      title: 'New item',
+      type: 'engineering',
+      body: 'New body',
+      status: 'blocked',
+      priority: 'p1',
+      blocked_reason: 'Waiting for dependency',
+      abandoned_reason: null,
+      links: [{ kind: 'url', url: 'https://example.com/context' }],
+      source_context: null,
+      depends_on: ['ai-tools--tooling--existing'],
+      branch: null,
+      progress_note: null,
+      due_date: '2026-07-08',
+      console_url: 'https://gtm.gourmetpro.co/work/backlog/ai-tools--tooling--new'
+    }
+  ];
+}
+
+function targetRows() {
+  if (process.env.FAKE_EXISTING_TARGETS !== '1') return [];
+  return [{
+    id: 'gourmetpro--ai-tools--3',
+    repo: 'GourmetPro/ai-tools',
+    workstream: 'tooling',
+    title: 'Existing item',
+    type: 'engineering',
+    body: 'Existing body',
+    status: 'queued',
+    priority: 'p2',
+    links: [],
+    source_context: 'Migrated from Postgres backlog item: ai-tools--tooling--existing',
+    depends_on: [],
+    branch: null,
+    progress_note: null,
+    due_date: null,
+    console_url: 'https://github.com/GourmetPro/ai-tools/issues/3'
+  }];
+}
+
+function createdRow() {
+  const sourceContext = valueAfter('--source-context') || '';
+  const sourceId = (sourceContext.match(/Migrated from Postgres backlog item: ([^\n]+)/) || [])[1] || 'unknown';
+  const number = sourceId.endsWith('--existing') ? 10 : 11;
+  return {
+    id: `gourmetpro--ai-tools--${number}`,
+    repo: valueAfter('--repo'),
+    workstream: valueAfter('--workstream'),
+    title: valueAfter('--title'),
+    type: valueAfter('--type'),
+    body: valueAfter('--body') || '',
+    status: 'queued',
+    priority: valueAfter('--priority') || 'p2',
+    links: [],
+    source_context: sourceContext,
+    depends_on: [],
+    branch: valueAfter('--branch'),
+    progress_note: valueAfter('--progress-note'),
+    due_date: valueAfter('--due-date'),
+    console_url: `https://github.com/GourmetPro/ai-tools/issues/${number}`
+  };
+}
+
+const backend = valueAfter('--backend');
+const command = commandName();
+if (backend === 'pg' && command === 'list-items') {
+  const offset = Number(valueAfter('--offset') || 0);
+  process.stdout.write(JSON.stringify(offset === 0 ? sourceRows() : []));
+} else if (backend === 'gh' && command === 'list-items') {
+  process.stdout.write(JSON.stringify(targetRows()));
+} else if (backend === 'gh' && command === 'create-item') {
+  process.stdout.write(JSON.stringify(createdRow()));
+} else if (backend === 'gh' && command === 'update-item') {
+  process.stdout.write(JSON.stringify({ id: valueAfter('--id'), status: valueAfter('--status') || 'queued' }));
+} else {
+  console.error(`unexpected fake backlog call: ${args.join(' ')}`);
+  process.exit(2);
+}
+JS
+  chmod +x "$fake"
+}
+
+test_migrate_postgres_backlog_to_github_dry_run() {
+  local tmp="$1"
+  write_fake_backlog_for_migration "$tmp/backlog"
+  : > "$tmp/calls.log"
+
+  FAKE_BACKLOG_LOG="$tmp/calls.log" FAKE_EXISTING_TARGETS=1 \
+    "$ROOT/scripts/migrate-postgres-backlog-to-github" \
+    --backlog-bin "$tmp/backlog" \
+    --source-backend pg \
+    --target-backend gh > "$tmp/out" 2> "$tmp/err" || {
+      fail "migration dry-run should succeed; stderr was: $(<"$tmp/err")"
+      return 1
+    }
+
+  assert_contains '"dryRun": true' "$tmp/out" "dry-run summary" || return 1
+  assert_contains '"sourceCount": 2' "$tmp/out" "dry-run source count" || return 1
+  assert_contains '"existingCount": 1' "$tmp/out" "dry-run existing count" || return 1
+  assert_contains '"wouldCreateCount": 1' "$tmp/out" "dry-run create count" || return 1
+  assert_contains '"target_id": null' "$tmp/out" "dry-run dependency waits for created target" || return 1
+  assert_contains '"--status","queued,in_progress,blocked"' "$tmp/calls.log" "source query only requests open statuses" || return 1
+  if grep -Fq '"create-item"' "$tmp/calls.log"; then
+    fail "dry-run migration must not create issues"
+    return 1
+  fi
+}
+
+test_migrate_postgres_backlog_to_github_execute() {
+  local tmp="$1"
+  write_fake_backlog_for_migration "$tmp/backlog"
+  : > "$tmp/calls.log"
+
+  FAKE_BACKLOG_LOG="$tmp/calls.log" FAKE_EXISTING_TARGETS=0 \
+    "$ROOT/scripts/migrate-postgres-backlog-to-github" \
+    --backlog-bin "$tmp/backlog" \
+    --source-backend pg \
+    --target-backend gh \
+    --execute > "$tmp/out" 2> "$tmp/err" || {
+      fail "migration execute should succeed; stderr was: $(<"$tmp/err")"
+      return 1
+    }
+
+  assert_contains '"dryRun": false' "$tmp/out" "execute summary" || return 1
+  assert_contains '"createdCount": 2' "$tmp/out" "execute created count" || return 1
+  assert_contains '"statusUpdateCount": 1' "$tmp/out" "execute status update count" || return 1
+  assert_contains '"dependencyUpdateCount": 1' "$tmp/out" "execute dependency update count" || return 1
+  assert_contains '"create-item"' "$tmp/calls.log" "execute creates issues" || return 1
+  assert_contains '"--depends-on","gourmetpro--ai-tools--10"' "$tmp/calls.log" "execute translates dependencies to GitHub IDs" || return 1
 }
 
 test_wt_installs_separately() {
@@ -1244,6 +1458,7 @@ run_test "backlog selects postgres backend from JSON config" with_tmpdir test_ba
 run_test "backlog backend flag overrides default backend" with_tmpdir test_backlog_backend_flag_overrides_default_backend
 run_test "backlog backend flag can appear after command" with_tmpdir test_backlog_backend_flag_can_appear_after_command
 run_test "backlog database URL env overrides JSON postgres URL" with_tmpdir test_backlog_database_url_env_overrides_postgres_backend_url
+run_test "backlog lists configured backends without secrets" with_tmpdir test_backlog_list_backends_redacts_configured_secrets
 run_test "backlog github create-repo validation is adapter-owned" with_tmpdir test_backlog_github_create_repo_does_not_require_postgres_alias_flags
 run_test "backlog github id and frontmatter helpers" with_tmpdir test_backlog_github_id_and_frontmatter_helpers
 run_test "backlog github repository commands" with_tmpdir test_backlog_github_repository_commands
@@ -1254,6 +1469,8 @@ run_test "backlog github read tolerates status drift" with_tmpdir test_backlog_g
 run_test "backlog github ignores pull requests" with_tmpdir test_backlog_github_ignores_pull_requests
 run_test "backlog github list summarize and blocks" with_tmpdir test_backlog_github_list_summarize_and_blocks
 run_test "backlog documents CLI usage for agents" with_tmpdir test_backlog_documents_cli_for_agents
+run_test "migration dry-run plans open postgres items" with_tmpdir test_migrate_postgres_backlog_to_github_dry_run
+run_test "migration execute creates issues and dependencies" with_tmpdir test_migrate_postgres_backlog_to_github_execute
 run_test "wt has its own installer" with_tmpdir test_wt_installs_separately
 run_test "envrun has its own installer" with_tmpdir test_envrun_installs_separately
 run_test "backlog has its own installer and config setup" with_tmpdir test_backlog_installs_separately_and_writes_config
