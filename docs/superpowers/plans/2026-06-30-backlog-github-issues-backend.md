@@ -1320,6 +1320,8 @@ README should include:
 ```
 
 Formula caveats should point to `~/.config/ai-tools/backlog.json` and mention old `.conf` compatibility.
+GitHub backend docs should state that a private local config can use literal `"token"`,
+while shared examples should keep using `"tokenEnv"`.
 
 - [ ] **Step 6: Run tests**
 

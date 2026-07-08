@@ -52,7 +52,10 @@ and `BACKLOG_DATABASE_URL` remain supported for Postgres compatibility.
 
 The GitHub backend stores backlog metadata in issue labels, issue body
 frontmatter, native issue dependencies, issue types, and configured issue fields
-when available. Configure `GITHUB_TOKEN` with repository issue write access.
+when available. Configure `GITHUB_TOKEN` with repository issue write access, or
+put a `"token": "..."` value directly in your private `backlog.json` so the
+backend does not need a token environment variable. Keep that file mode `0600`
+and do not commit it.
 
 ## Install Without Homebrew
 

@@ -5,9 +5,9 @@ class Backlog < Formula
   desc "Database-backed backlog CLI"
   homepage "https://github.com/GourmetPro/ai-tools"
   url "https://github.com/GourmetPro/ai-tools.git",
-      tag:      "v0.3.2",
-      revision: "fcda164021865771478e6daf1e30f855c8587a59"
-  version "0.3.2"
+      tag:      "v0.3.3",
+      revision: "43334e375feab6a10ba179436c02e105f56d7fa5"
+  version "0.3.3"
   depends_on "libpq"
   depends_on "node"
 
@@ -38,6 +38,8 @@ class Backlog < Formula
         }
 
       You can choose a backend with --backend or BACKLOG_BACKEND.
+      GitHub backends can use tokenEnv, or a literal token in a private
+      mode-0600 backlog.json.
       Existing ~/.config/ai-tools/backlog.conf files remain supported for
       Postgres compatibility when no backlog.json exists.
     EOS

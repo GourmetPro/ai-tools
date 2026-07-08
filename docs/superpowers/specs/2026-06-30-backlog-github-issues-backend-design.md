@@ -123,8 +123,8 @@ Both backends support env-var indirection for secrets:
 - GitHub: `tokenEnv`
 - Postgres: `databaseUrlEnv`
 
-Literal `databaseUrl` remains supported for local setups, but docs should
-prefer `databaseUrlEnv`.
+Literal `token` and `databaseUrl` remain supported for private local setups, but
+durable shared examples should prefer `tokenEnv` and `databaseUrlEnv`.
 
 `features.issueFields` is the canonical GitHub issue field configuration name.
 During migration, the implementation may accept `features.customFields` as a
@@ -177,7 +177,8 @@ should require Node 18 or newer for GitHub support.
 
 ### Authentication
 
-The GitHub adapter reads a token from the configured `tokenEnv`.
+The GitHub adapter reads a token from the backend's literal `token` when present,
+otherwise from the configured `tokenEnv`, defaulting to `GITHUB_TOKEN`.
 
 Requests use GitHub REST API conventions:
 

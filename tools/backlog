@@ -559,6 +559,12 @@ function formatFrontmatter(meta, body) {
 }
 
 function githubToken(backend) {
+  if (backend.token !== undefined) {
+    if (typeof backend.token !== 'string' || !backend.token) {
+      die(`token must be a non-empty string for github-issues backend ${backend.name}`);
+    }
+    return backend.token;
+  }
   const envName = backend.tokenEnv || 'GITHUB_TOKEN';
   const token = process.env[envName];
   if (!token) die(`${envName} is not set for github-issues backend ${backend.name}`);
@@ -1413,6 +1419,8 @@ Configuration:
   }
 
 GitHub backend notes:
+  GitHub authentication uses "token" from backlog.json when present, otherwise
+  the configured tokenEnv value, defaulting to GITHUB_TOKEN.
   GitHub stores backlog metadata in issue labels, issue body frontmatter, native
   issue dependencies, issue types, and configured issue fields when available.
   Issue field mirroring uses GitHub's issue-only field API and preserves

@@ -478,8 +478,8 @@ const server = http.createServer((req, res) => {
   req.on('data', (chunk) => { body += chunk; });
   req.on('end', () => {
     const parsed = body ? JSON.parse(body) : {};
-    if (url.pathname.includes('/issue-field-values') || url.pathname.match(/^\/orgs\/[^/]+\/issue-fields$/)) {
-      headerLog.push({ method: req.method, path: url.pathname, version: req.headers['x-github-api-version'] });
+    if (url.pathname === '/user/repos' || url.pathname.includes('/issue-field-values') || url.pathname.match(/^\/orgs\/[^/]+\/issue-fields$/)) {
+      headerLog.push({ method: req.method, path: url.pathname, version: req.headers['x-github-api-version'], authorization: req.headers.authorization });
     }
     if (req.method === 'GET' && url.pathname === '/user/repos') return send(res, 200, [repo]);
     if (req.method === 'GET' && url.pathname === '/installation/repositories') return send(res, 200, { repositories: [repo] });
@@ -722,6 +722,38 @@ test_backlog_github_repository_commands() {
   curl -sS "http://127.0.0.1:$port/__test/headers" > "$tmp/headers.out"
   assert_contains '"path":"/orgs/GourmetPro/issue-fields"' "$tmp/headers.out" "github probes organization issue fields" || return 1
   assert_contains '"version":"2026-03-10"' "$tmp/headers.out" "github issue field probe uses current API version" || return 1
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
+test_backlog_github_literal_token_config() {
+  local tmp="$1"
+  local pid port
+  start_fake_github "$tmp"
+  pid="$FAKE_GITHUB_PID"
+  port="$(cat "$tmp/fake-github.port")"
+
+  mkdir -p "$tmp/config"
+  cat > "$tmp/config/backlog.json" <<JSON
+{
+  "default": "gh",
+  "backends": [
+    { "name": "gh", "type": "github-issues", "token": "literal-test-token", "apiBaseUrl": "http://127.0.0.1:$port" }
+  ]
+}
+JSON
+
+  env -u GITHUB_TOKEN -u GH_TOKEN -u TEST_GITHUB_TOKEN \
+    BACKLOG_CONFIG="$tmp/config/backlog.json" \
+    "$ROOT/tools/backlog" list-repos > "$tmp/list.out" 2> "$tmp/list.err" || {
+      fail "github literal token config should succeed without token env; stderr was: $(<"$tmp/list.err")"
+      return 1
+    }
+
+  curl -sS "http://127.0.0.1:$port/__test/headers" > "$tmp/headers.out"
+  assert_contains '"path":"/user/repos"' "$tmp/headers.out" "github literal token request path" || return 1
+  assert_contains '"authorization":"Bearer literal-test-token"' "$tmp/headers.out" "github literal token auth header" || return 1
+
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
 }
@@ -1215,6 +1247,7 @@ run_test "backlog database URL env overrides JSON postgres URL" with_tmpdir test
 run_test "backlog github create-repo validation is adapter-owned" with_tmpdir test_backlog_github_create_repo_does_not_require_postgres_alias_flags
 run_test "backlog github id and frontmatter helpers" with_tmpdir test_backlog_github_id_and_frontmatter_helpers
 run_test "backlog github repository commands" with_tmpdir test_backlog_github_repository_commands
+run_test "backlog github supports literal token config" with_tmpdir test_backlog_github_literal_token_config
 run_test "backlog github create get update item and issue fields" with_tmpdir test_backlog_github_create_get_update_item_and_fields
 run_test "backlog github rejects explicit create id" with_tmpdir test_backlog_github_rejects_explicit_create_id
 run_test "backlog github read tolerates status drift" with_tmpdir test_backlog_github_read_tolerates_human_edited_status_drift
