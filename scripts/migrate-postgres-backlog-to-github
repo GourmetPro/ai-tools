@@ -1,0 +1,327 @@
+#!/usr/bin/env node
+// Migrate open Postgres backlog items to GitHub Issues via the backlog CLI.
+
+const path = require('path');
+const { spawnSync } = require('child_process');
+
+const ROOT = path.join(__dirname, '..');
+const DEFAULT_BACKLOG_BIN = path.join(ROOT, 'tools', 'backlog');
+const OPEN_STATUSES = ['queued', 'in_progress', 'blocked'];
+const ALL_STATUSES = ['queued', 'in_progress', 'blocked', 'done', 'abandoned'];
+const MIGRATION_MARKER_PREFIX = 'Migrated from Postgres backlog item: ';
+const DEFAULT_LIMIT = 500;
+
+function usage(exitCode = 0) {
+  const out = exitCode === 0 ? process.stdout : process.stderr;
+  out.write(`Usage: scripts/migrate-postgres-backlog-to-github [options]
+
+Migrates Postgres backlog items to GitHub Issues using tools/backlog.
+Dry-run is the default. Pass --execute to create or update GitHub issues.
+
+Options:
+  --source-backend <name>  Postgres backend name (default: gtm-console)
+  --target-backend <name>  GitHub Issues backend name (default: github)
+  --repo <org/repo>        Limit migration to one repository
+  --status <csv>           Source statuses to migrate (default: queued,in_progress,blocked)
+  --limit <n>              Postgres page size, max 500 (default: 500)
+  --backlog-bin <path>     backlog executable (default: tools/backlog)
+  --execute                Perform writes; otherwise only report planned work
+  --dry-run                Force dry-run mode
+  -h, --help               Show this help
+
+Examples:
+  scripts/migrate-postgres-backlog-to-github
+  scripts/migrate-postgres-backlog-to-github --repo GourmetPro/ai-tools --execute
+`);
+  process.exit(exitCode);
+}
+
+function fail(message) {
+  console.error(`migrate-postgres-backlog-to-github: ${message}`);
+  process.exit(2);
+}
+
+function parseArgs(argv) {
+  const opts = {
+    sourceBackend: 'gtm-console',
+    targetBackend: 'github',
+    statuses: [...OPEN_STATUSES],
+    limit: DEFAULT_LIMIT,
+    backlogBin: DEFAULT_BACKLOG_BIN,
+    execute: false,
+  };
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    const next = () => {
+      const value = argv[++i];
+      if (!value) fail(`${arg} requires a value`);
+      return value;
+    };
+    if (arg === '-h' || arg === '--help') usage(0);
+    else if (arg === '--source-backend') opts.sourceBackend = next();
+    else if (arg === '--target-backend') opts.targetBackend = next();
+    else if (arg === '--repo') opts.repo = next();
+    else if (arg === '--status') opts.statuses = parseStatuses(next());
+    else if (arg === '--limit') opts.limit = parseLimit(next());
+    else if (arg === '--backlog-bin') opts.backlogBin = next();
+    else if (arg === '--execute') opts.execute = true;
+    else if (arg === '--dry-run') opts.execute = false;
+    else fail(`unknown option: ${arg}`);
+  }
+
+  return opts;
+}
+
+function parseStatuses(raw) {
+  const statuses = raw.split(',').map((s) => s.trim()).filter(Boolean);
+  if (!statuses.length) fail('--status must include at least one status');
+  for (const status of statuses) {
+    if (!ALL_STATUSES.includes(status)) fail(`bad status "${status}"`);
+  }
+  return statuses;
+}
+
+function parseLimit(raw) {
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n <= 0 || n > 500) fail('--limit must be an integer from 1 to 500');
+  return n;
+}
+
+function runBacklog(opts, args) {
+  const res = spawnSync(opts.backlogBin, args, {
+    encoding: 'utf8',
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  if (res.error) fail(`failed to run ${opts.backlogBin}: ${res.error.message}`);
+  if (res.status !== 0) {
+    const stderr = (res.stderr || '').trim();
+    fail(`backlog ${args.join(' ')} failed${stderr ? `: ${stderr}` : ''}`);
+  }
+  try {
+    return JSON.parse(res.stdout || 'null');
+  } catch (e) {
+    fail(`backlog ${args.join(' ')} returned invalid JSON: ${e.message}`);
+  }
+}
+
+function addArg(args, flag, value) {
+  if (value === undefined || value === null || value === '') return;
+  args.push(flag, String(value));
+}
+
+function markerFor(row) {
+  return `${MIGRATION_MARKER_PREFIX}${row.id}`;
+}
+
+function sourceContextFor(row) {
+  const parts = [];
+  if (row.source_context) parts.push(String(row.source_context).trim());
+  parts.push(markerFor(row));
+  if (row.console_url) parts.push(`Original console URL: ${row.console_url}`);
+  return parts.filter(Boolean).join('\n\n');
+}
+
+function migratedSourceIds(row) {
+  const ids = [];
+  for (const line of String(row.source_context || '').split(/\r?\n/)) {
+    if (line.startsWith(MIGRATION_MARKER_PREFIX)) {
+      const id = line.slice(MIGRATION_MARKER_PREFIX.length).trim();
+      if (id) ids.push(id);
+    }
+  }
+  return ids;
+}
+
+function ensureArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function fetchSourceRows(opts) {
+  const rows = [];
+  let offset = 0;
+  while (true) {
+    const args = [
+      '--backend', opts.sourceBackend,
+      'list-items',
+      '--status', opts.statuses.join(','),
+      '--limit', String(opts.limit),
+      '--offset', String(offset),
+    ];
+    addArg(args, '--repo', opts.repo);
+    const page = runBacklog(opts, args);
+    if (!Array.isArray(page)) fail('source list-items did not return an array');
+    rows.push(...page);
+    if (page.length < opts.limit) break;
+    offset += page.length;
+  }
+  return rows;
+}
+
+function indexExistingTargets(opts, repos) {
+  const bySourceId = new Map();
+  for (const repo of repos) {
+    console.error(`Indexing existing GitHub backlog issues in ${repo}`);
+    const rows = runBacklog(opts, [
+      '--backend', opts.targetBackend,
+      'list-items',
+      '--repo', repo,
+      '--limit', 'all',
+    ]);
+    if (!Array.isArray(rows)) fail(`target list-items for ${repo} did not return an array`);
+    for (const target of rows) {
+      for (const sourceId of migratedSourceIds(target)) {
+        if (!bySourceId.has(sourceId)) bySourceId.set(sourceId, target);
+      }
+    }
+  }
+  return bySourceId;
+}
+
+function createArgsFor(row, opts) {
+  const args = [
+    '--backend', opts.targetBackend,
+    'create-item',
+    '--repo', row.repo,
+    '--workstream', row.workstream,
+    '--title', row.title,
+    '--type', row.type,
+    '--priority', row.priority || 'p2',
+    '--source-context', sourceContextFor(row),
+  ];
+  addArg(args, '--body', row.body);
+  addArg(args, '--branch', row.branch);
+  addArg(args, '--progress-note', row.progress_note);
+  addArg(args, '--due-date', row.due_date);
+  args.push('--links', JSON.stringify(ensureArray(row.links)));
+  return args;
+}
+
+function statusUpdateArgsFor(row, targetId, opts, warnings) {
+  if (row.status === 'queued') return null;
+  const args = ['--backend', opts.targetBackend, 'update-item', '--id', targetId, '--status', row.status];
+  if (row.status === 'in_progress' && !(row.branch || '').trim() && !(row.progress_note || '').trim()) {
+    args.push('--progress-note', 'Migrated from Postgres backlog item that was already in progress.');
+    warnings.push({ source_id: row.id, warning: 'in_progress item had no branch or progress_note; used migration placeholder' });
+  }
+  if (row.status === 'blocked') {
+    let reason = row.blocked_reason;
+    if (!reason) {
+      reason = 'Migrated from Postgres backlog item without a blocked_reason.';
+      warnings.push({ source_id: row.id, warning: 'blocked item had no blocked_reason; used migration placeholder' });
+    }
+    args.push('--blocked-reason', reason);
+  }
+  return args;
+}
+
+function dependencyUpdateArgsFor(row, targetId, translated, opts) {
+  return [
+    '--backend', opts.targetBackend,
+    'update-item',
+    '--id', targetId,
+    '--depends-on', translated.join(','),
+  ];
+}
+
+function createSummary(opts, sourceRows) {
+  return {
+    dryRun: !opts.execute,
+    sourceBackend: opts.sourceBackend,
+    targetBackend: opts.targetBackend,
+    statuses: opts.statuses,
+    repo: opts.repo || null,
+    sourceCount: sourceRows.length,
+    existingCount: 0,
+    createdCount: 0,
+    wouldCreateCount: 0,
+    statusUpdateCount: 0,
+    dependencyUpdateCount: 0,
+    skippedExisting: [],
+    created: [],
+    wouldCreate: [],
+    dependencyUpdates: [],
+    missingDependencies: [],
+    warnings: [],
+  };
+}
+
+async function main() {
+  const opts = parseArgs(process.argv.slice(2));
+  const sourceRows = fetchSourceRows(opts);
+  const summary = createSummary(opts, sourceRows);
+  const repos = [...new Set(sourceRows.map((row) => row.repo).filter(Boolean))].sort();
+  const existingBySourceId = indexExistingTargets(opts, repos);
+  const targetBySourceId = new Map();
+  const sourceById = new Map(sourceRows.map((row) => [row.id, row]));
+
+  for (const row of sourceRows) {
+    const existing = existingBySourceId.get(row.id);
+    if (existing) {
+      summary.existingCount += 1;
+      summary.skippedExisting.push({ source_id: row.id, target_id: existing.id, repo: row.repo });
+      targetBySourceId.set(row.id, existing);
+      continue;
+    }
+
+    if (!opts.execute) {
+      summary.wouldCreateCount += 1;
+      summary.wouldCreate.push({ source_id: row.id, repo: row.repo, title: row.title, status: row.status });
+      continue;
+    }
+
+    console.error(`Creating GitHub issue for ${row.id} in ${row.repo}`);
+    const created = runBacklog(opts, createArgsFor(row, opts));
+    targetBySourceId.set(row.id, created);
+    summary.createdCount += 1;
+    summary.created.push({ source_id: row.id, target_id: created.id, repo: row.repo, url: created.console_url });
+
+    const statusArgs = statusUpdateArgsFor(row, created.id, opts, summary.warnings);
+    if (statusArgs) {
+      console.error(`Updating migrated status for ${row.id} -> ${row.status}`);
+      const updated = runBacklog(opts, statusArgs);
+      targetBySourceId.set(row.id, updated);
+      summary.statusUpdateCount += 1;
+    }
+  }
+
+  for (const row of sourceRows) {
+    const deps = ensureArray(row.depends_on);
+    if (!deps.length) continue;
+    const target = targetBySourceId.get(row.id);
+    const translated = [];
+    const missing = [];
+    for (const sourceDepId of deps) {
+      const depTarget = targetBySourceId.get(sourceDepId) || existingBySourceId.get(sourceDepId);
+      if (depTarget) translated.push(depTarget.id);
+      else missing.push(sourceDepId);
+    }
+    if (missing.length) {
+      summary.missingDependencies.push({
+        source_id: row.id,
+        missing,
+        reason: missing.some((id) => sourceById.has(id))
+          ? 'dependency target is in this run but has no GitHub issue yet'
+          : 'dependency target was not selected for this open-item migration',
+      });
+    }
+    if (!translated.length) continue;
+
+    summary.dependencyUpdates.push({
+      source_id: row.id,
+      target_id: target ? target.id : null,
+      depends_on: translated,
+      dry_run: !opts.execute,
+    });
+
+    if (opts.execute && target) {
+      console.error(`Updating migrated dependencies for ${row.id}`);
+      runBacklog(opts, dependencyUpdateArgsFor(row, target.id, translated, opts));
+      summary.dependencyUpdateCount += 1;
+    }
+  }
+
+  process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
+}
+
+main().catch((e) => fail(e && e.message ? e.message : String(e)));
