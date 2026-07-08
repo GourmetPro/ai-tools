@@ -1,33 +1,7 @@
 #!/usr/bin/env node
-// Backlog CLI — mimics the /mcp/backlog MCP tools by talking straight to the
-// configured database. It reads DATABASE_URL from an editable config file
-// (default: ~/.config/ai-tools/backlog.conf; override with BACKLOG_CONFIG).
-// BACKLOG_DATABASE_URL can override the file for one-off agent sessions.
-// Prints JSON to stdout. Non-zero exit + one-line stderr on failure.
-// Requires `psql` on PATH (same as tools/psql).
-//
-// Flags accept `--flag value` or `--flag=value` (use the latter for values
-// that themselves start with `--`). Unknown flags are rejected.
-//
-// Subcommands (≈ MCP tool):
-//   tools/backlog list-repos
-//   tools/backlog create-repo --slug <gh-slug> --short-slug <s> --display-name <n> [--default-branch main] [--color <hex>]
-//   tools/backlog list-items [--repo R] [--workstream W] [--status s1,s2] [--type T] [--priority P] [--q TEXT] [--limit N] [--offset N]
-//   tools/backlog get-item --id <id>
-//   tools/backlog summarize [--workstream W] [--repo R]
-//   tools/backlog create-item --repo <gh-slug> --workstream <w> --title <t> --type engineering|spec_pending_impl|wiki_ops
-//                             [--body B] [--priority p0|p1|p2|p3] [--source-context C] [--depends-on id1,id2]
-//                             [--branch BR] [--progress-note N] [--due-date YYYY-MM-DD] [--links '<json array>'] [--id <explicit-id>]
-//   tools/backlog update-item --id <id> [--status queued|in_progress|blocked|done|abandoned] [--priority P] [--title T]
-//                             [--body B] [--blocked-reason R] [--abandoned-reason R] [--depends-on id1,id2]
-//                             [--branch BR] [--progress-note N] [--due-date D] [--links '<json array>']
-//
-// Input rules mirror code/console/src/lib/schemas/backlog{,-repo}.ts and
-// lib/backlog-palette.ts — keep in sync. Mutations write a console_audit_log
-// row (actor: tools-backlog) in the same transaction, mirroring the MCP entity
-// layer. Skipped vs MCP: dep_status / cycle detection, link→registered-repo
-// checks, and Next.js cache invalidation — the console UI and the MCP read
-// tools may serve cached pre-mutation state for a few minutes after a CLI write.
+// Backlog CLI. Prints pretty JSON to stdout; failures print one line to stderr
+// and exit non-zero. The default legacy backend is Postgres via psql. Named
+// backends can be configured in ~/.config/ai-tools/backlog.json.
 
 const fs = require('fs');
 const path = require('path');
@@ -35,20 +9,33 @@ const { spawnSync } = require('child_process');
 
 const CONSOLE_BASE_URL = 'https://gtm.gourmetpro.co';
 const ACTOR = { userId: 'tools-backlog', email: 'tools-backlog@gourmetpro.co' };
+const DEFAULT_GITHUB_API_VERSION = '2026-03-10';
 
 function fail(msg) {
   console.error(`tools/backlog: ${msg}`);
   process.exit(2);
 }
 
-// --- config loading: BACKLOG_DATABASE_URL > editable config file -----------------
-function defaultConfigPath() {
-  const configHome = process.env.XDG_CONFIG_HOME
+function die(msg) {
+  const err = new Error(msg);
+  err.backlogCli = true;
+  throw err;
+}
+
+// --- config loading -----------------------------------------------------------
+function configHome() {
+  const home = process.env.XDG_CONFIG_HOME
     || (process.env.HOME ? path.join(process.env.HOME, '.config') : null);
-  if (!configHome) {
-    fail('HOME is not set; set BACKLOG_CONFIG to an explicit backlog.conf path');
-  }
-  return path.join(configHome, 'ai-tools', 'backlog.conf');
+  if (!home) fail('HOME is not set; set BACKLOG_CONFIG to an explicit config path');
+  return path.join(home, 'ai-tools');
+}
+
+function defaultJsonConfigPath() {
+  return path.join(configHome(), 'backlog.json');
+}
+
+function defaultLegacyConfigPath() {
+  return path.join(configHome(), 'backlog.conf');
 }
 
 function cleanConfigValue(raw) {
@@ -72,19 +59,98 @@ function loadConfigFile(file) {
   return out;
 }
 
-function loadDatabaseUrl() {
-  const configPath = process.env.BACKLOG_CONFIG || defaultConfigPath();
-  const config = loadConfigFile(configPath);
-  const dbUrl = process.env.BACKLOG_DATABASE_URL || config.DATABASE_URL;
-  if (!dbUrl) {
-    fail(`DATABASE_URL is not configured. Edit ${configPath} or run install/backlog --database-url '<postgres-url>'.`);
+function readJsonConfig(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (e) {
+    fail(`invalid JSON config ${file}: ${e.message}`);
   }
-  return dbUrl;
 }
 
-// --- psql helpers --------------------------------------------------------------
-function runSql(sql) {
-  const res = spawnSync('psql', [loadDatabaseUrl(), '-X', '-q', '-At', '-v', 'ON_ERROR_STOP=1', '-c', sql], {
+function isJsonConfigPath(file) {
+  if (file.endsWith('.json')) return true;
+  if (!fs.existsSync(file)) return false;
+  return fs.readFileSync(file, 'utf8').trim().startsWith('{');
+}
+
+function loadBacklogConfig() {
+  if (process.env.BACKLOG_CONFIG) {
+    const file = process.env.BACKLOG_CONFIG;
+    if (isJsonConfigPath(file)) {
+      if (!fs.existsSync(file)) fail(`config file not found: ${file}`);
+      return { kind: 'json', file, config: readJsonConfig(file) };
+    }
+    return { kind: 'legacy', file, config: loadConfigFile(file) };
+  }
+
+  const jsonPath = defaultJsonConfigPath();
+  if (fs.existsSync(jsonPath)) return { kind: 'json', file: jsonPath, config: readJsonConfig(jsonPath) };
+
+  const legacyPath = defaultLegacyConfigPath();
+  return { kind: 'legacy', file: legacyPath, config: loadConfigFile(legacyPath) };
+}
+
+function parseGlobalArgs(argv) {
+  const globals = {};
+  const rest = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--backend') {
+      const v = argv[++i];
+      if (!v) fail('--backend requires a value');
+      globals.backend = v;
+    } else if (a.startsWith('--backend=')) {
+      const v = a.slice('--backend='.length);
+      if (!v) fail('--backend requires a value');
+      globals.backend = v;
+    } else {
+      rest.push(a);
+    }
+  }
+  return { globals, rest };
+}
+
+function selectBackendConfig(globals) {
+  const loaded = loadBacklogConfig();
+  if (loaded.kind === 'json') {
+    const backends = loaded.config.backends;
+    if (!Array.isArray(backends) || !backends.length) {
+      fail(`backlog JSON config ${loaded.file} must contain a non-empty "backends" array`);
+    }
+    const selected = globals.backend || process.env.BACKLOG_BACKEND || loaded.config.default || backends[0].name;
+    const backend = backends.find((b) => b && b.name === selected);
+    if (!backend) fail(`backend "${selected}" is not defined in ${loaded.file}`);
+    return normalizeBackend({ ...backend }, loaded.file);
+  }
+
+  if (globals.backend || process.env.BACKLOG_BACKEND) {
+    fail('named backends require backlog.json config');
+  }
+  const dbUrl = process.env.BACKLOG_DATABASE_URL || loaded.config.DATABASE_URL;
+  if (!dbUrl) {
+    fail(`DATABASE_URL is not configured. Edit ${loaded.file} or run install/backlog --database-url '<postgres-url>'.`);
+  }
+  return { name: 'legacy-postgres', type: 'postgres', databaseUrl: dbUrl, configFile: loaded.file };
+}
+
+function normalizeBackend(backend, configFile) {
+  if (!backend.name) fail(`backend in ${configFile} is missing "name"`);
+  if (!backend.type) fail(`backend ${backend.name} in ${configFile} is missing "type"`);
+  backend.configFile = configFile;
+  if (backend.type === 'postgres') {
+    const envUrl = backend.databaseUrlEnv ? process.env[backend.databaseUrlEnv] : undefined;
+    backend.databaseUrl = process.env.BACKLOG_DATABASE_URL || envUrl || backend.databaseUrl;
+    if (!backend.databaseUrl) {
+      const hint = backend.databaseUrlEnv || 'BACKLOG_DATABASE_URL';
+      fail(`DATABASE_URL is not configured for postgres backend ${backend.name}; set ${hint} or databaseUrl`);
+    }
+  }
+  return backend;
+}
+
+// --- psql helpers -------------------------------------------------------------
+function runSql(sql, backend) {
+  const res = spawnSync('psql', [backend.databaseUrl, '-X', '-q', '-At', '-v', 'ON_ERROR_STOP=1', '-c', sql], {
     encoding: 'utf8',
     maxBuffer: 64 * 1024 * 1024,
   });
@@ -92,30 +158,33 @@ function runSql(sql) {
   if (res.status !== 0) fail(`psql error: ${(res.stderr || '').trim()}`);
   return res.stdout.trim();
 }
-function queryJson(sql) {
-  const out = runSql(sql);
+
+function queryJson(sql, backend) {
+  const out = runSql(sql, backend);
   return out ? JSON.parse(out) : null;
 }
 
-// SQL literal builders. lit() doubles single quotes; never interpolate raw input.
 function lit(v) {
   if (v === null || v === undefined) return 'NULL';
   return `'${String(v).replace(/'/g, "''")}'`;
 }
+
 function textArray(arr) {
   if (!arr.length) return `'{}'::text[]`;
   return `ARRAY[${arr.map(lit).join(',')}]::text[]`;
 }
+
 function jsonbLit(v) {
   return `${lit(JSON.stringify(v))}::jsonb`;
 }
+
 function intLit(v, name) {
   const n = Number(v);
   if (!Number.isInteger(n) || n < 0) fail(`--${name} must be a non-negative integer`);
   return n;
 }
 
-// --- arg parsing: --flag value | --flag=value pairs ------------------------------
+// --- arg parsing and validation ----------------------------------------------
 function parseArgs(argv) {
   const args = {};
   for (let i = 0; i < argv.length; i++) {
@@ -134,14 +203,17 @@ function parseArgs(argv) {
   }
   return args;
 }
+
 function require_(args, keys) {
   for (const k of keys) if (args[k] === undefined) fail(`--${k} is required`);
 }
+
 function oneOf(args, key, allowed) {
   if (args[key] !== undefined && !allowed.includes(args[key])) {
     fail(`--${key} must be one of: ${allowed.join(', ')}`);
   }
 }
+
 function checkLen(args, key, min, max) {
   const v = args[key];
   if (v === undefined) return;
@@ -152,34 +224,34 @@ function checkLen(args, key, min, max) {
 const STATUSES = ['queued', 'in_progress', 'blocked', 'done', 'abandoned'];
 const PRIORITIES = ['p0', 'p1', 'p2', 'p3'];
 const TYPES = ['engineering', 'spec_pending_impl', 'wiki_ops'];
+const PRIORITY_ORDER = new Map(PRIORITIES.map((p, i) => [p, i]));
 
-// Mirrors code/console/src/lib/schemas/backlog.ts, backlog-repo.ts, backlog-palette.ts.
 const ID_REGEX = /^[a-z0-9-]+--[a-z0-9-]+--[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
+const GITHUB_ID_REGEX = /^[a-z0-9._-]+--.+--[1-9][0-9]*$/;
 const GITHUB_SLUG_REGEX = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const SHORT_SLUG_REGEX = /^[a-z0-9-]+$/;
 const HEX_COLOR_REGEX = /^#[0-9A-Fa-f]{6}$/;
 const ISO_DATE_REGEX = /^\d{4}-\d{2}-\d{2}$/;
 const REPO_PALETTE = ['#1A4D4A', '#9C6A2F', '#2D3A6B', '#6B2D5F', '#4A5D2E', '#8A2D2D'];
 
-// Mirrors src/lib/schemas/backlog.ts slugify.
 function slugify(input) {
   return input.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 80);
 }
+
 function withConsoleUrl(row) {
   return row ? { ...row, console_url: `${CONSOLE_BASE_URL}/work/backlog/${row.id}` } : row;
 }
-// Audit row written in the same statement, selecting FROM the mutation CTE so a
-// zero-row mutation writes no audit row.
+
 function auditInsertSql(entity, entityIdExpr, action, beforeExpr, afterExpr, fromCte) {
   return `INSERT INTO console_audit_log (actor_user_id, actor_email, entity, entity_id, action, before, after)
           SELECT ${lit(ACTOR.userId)}, ${lit(ACTOR.email)}, ${lit(entity)}, ${entityIdExpr}, ${lit(action)}, ${beforeExpr}, ${afterExpr} FROM ${fromCte}`;
 }
 
-// --- input validation (mirrors the zod input schemas) ---------------------------
 function isHttpUrl(v) {
   if (typeof v !== 'string') return false;
   try { new URL(v); return true; } catch { return false; }
 }
+
 function validateLink(l, i) {
   const bad = (msg) => fail(`--links[${i}]: ${msg}`);
   if (typeof l !== 'object' || l === null || Array.isArray(l)) bad('must be an object');
@@ -204,6 +276,7 @@ function validateLink(l, i) {
       bad(`unknown "kind" ${JSON.stringify(l.kind)} (spec|brief|pr|commit|url)`);
   }
 }
+
 function parseLinks(args) {
   if (args.links === undefined) return undefined;
   let links;
@@ -212,16 +285,20 @@ function parseLinks(args) {
   links.forEach(validateLink);
   return links;
 }
-// Format + uniqueness only; self-reference is checked by the caller once the
-// (possibly derived) item id is known.
-function parseDependsOn(raw) {
+
+function parseDependsOn(raw, github = false) {
   const arr = raw.split(',').filter(Boolean);
   for (const d of arr) {
-    if (!ID_REGEX.test(d)) fail(`--depends-on entry "${d}" must match <short-slug>--<workstream>--<kebab-slug>`);
+    if (github) {
+      parseGithubId(d);
+    } else if (!ID_REGEX.test(d)) {
+      fail(`--depends-on entry "${d}" must match <short-slug>--<workstream>--<kebab-slug>`);
+    }
   }
   if (new Set(arr).size !== arr.length) fail('--depends-on entries must be unique');
   return arr;
 }
+
 function validateItemFields(args) {
   checkLen(args, 'workstream', 1, 64);
   checkLen(args, 'title', 1, 200);
@@ -238,13 +315,28 @@ function validateItemFields(args) {
   }
 }
 
-// --- subcommands ---------------------------------------------------------------
-function cmdListRepos() {
-  return queryJson(`SELECT coalesce(json_agg(row_to_json(t)), '[]') FROM
-    (SELECT * FROM backlog_repos ORDER BY slug) t`);
+function validateBacklogWriteTransition(before, args) {
+  if (args.status === 'blocked' && !(args['blocked-reason'] || '').trim()) {
+    fail('status=blocked requires a non-empty --blocked-reason');
+  }
+  if (args.status === 'abandoned' && !(args['abandoned-reason'] || '').trim()) {
+    fail('status=abandoned requires a non-empty --abandoned-reason');
+  }
+  const resultingStatus = args.status ?? before.status;
+  const resultingBranch = args.branch !== undefined ? args.branch : before.branch;
+  const resultingNote = args['progress-note'] !== undefined ? args['progress-note'] : before.progress_note;
+  if (resultingStatus === 'in_progress' && !(resultingBranch || '').trim() && !(resultingNote || '').trim()) {
+    fail('in_progress requires either --branch or --progress-note (recovery signal)');
+  }
 }
 
-function cmdCreateRepo(args) {
+// --- Postgres commands --------------------------------------------------------
+function cmdListReposPostgres(args, backend) {
+  return queryJson(`SELECT coalesce(json_agg(row_to_json(t)), '[]') FROM
+    (SELECT * FROM backlog_repos ORDER BY slug) t`, backend);
+}
+
+function cmdCreateRepoPostgres(args, backend) {
   require_(args, ['slug', 'short-slug', 'display-name']);
   if (!GITHUB_SLUG_REGEX.test(args.slug)) fail('--slug must be a full GitHub slug <org>/<repo>');
   if (!SHORT_SLUG_REGEX.test(args['short-slug'])) fail('--short-slug must be lowercase kebab ([a-z0-9-])');
@@ -255,10 +347,10 @@ function cmdCreateRepo(args) {
 
   let color = args.color;
   if (!color) {
-    const taken = queryJson(`SELECT coalesce(json_agg(color), '[]') FROM backlog_repos`);
+    const taken = queryJson(`SELECT coalesce(json_agg(color), '[]') FROM backlog_repos`, backend);
     const takenSet = new Set(taken.map((c) => c.toUpperCase()));
     color = REPO_PALETTE.find((c) => !takenSet.has(c.toUpperCase()));
-    if (!color) fail('color palette exhausted — pass --color explicitly (#RRGGBB)');
+    if (!color) fail('color palette exhausted - pass --color explicitly (#RRGGBB)');
   }
   return queryJson(`
     WITH ins AS (
@@ -270,10 +362,10 @@ function cmdCreateRepo(args) {
     aud AS (
       ${auditInsertSql('backlog_repos', 'ins.slug', 'create', 'NULL', 'row_to_json(ins)::jsonb', 'ins')}
     )
-    SELECT row_to_json(ins) FROM ins`);
+    SELECT row_to_json(ins) FROM ins`, backend);
 }
 
-function cmdListItems(args) {
+function cmdListItemsPostgres(args, backend) {
   oneOf(args, 'type', TYPES);
   oneOf(args, 'priority', PRIORITIES);
   for (const k of ['repo', 'workstream', 'status', 'type', 'priority', 'q']) {
@@ -290,44 +382,42 @@ function cmdListItems(args) {
   if (args.type) conds.push(`type = ${lit(args.type)}`);
   if (args.priority) conds.push(`priority = ${lit(args.priority)}`);
   if (args.q) {
-    const esc = args.q.replace(/([\\%_])/g, '\\$1'); // literal match: escape ILIKE metachars
+    const esc = args.q.replace(/([\\%_])/g, '\\$1');
     conds.push(`(title ILIKE ${lit('%' + esc + '%')} OR body ILIKE ${lit('%' + esc + '%')})`);
   }
   const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
   const limit = Math.min(args.limit !== undefined ? intLit(args.limit, 'limit') : 50, 500);
   const offset = args.offset !== undefined ? intLit(args.offset, 'offset') : 0;
   const rows = queryJson(`SELECT coalesce(json_agg(row_to_json(t)), '[]') FROM
-    (SELECT * FROM backlog_items ${where} ORDER BY priority ASC, created_at DESC LIMIT ${limit} OFFSET ${offset}) t`);
+    (SELECT * FROM backlog_items ${where} ORDER BY priority ASC, created_at DESC LIMIT ${limit} OFFSET ${offset}) t`, backend);
   return rows.map(withConsoleUrl);
 }
 
-function cmdGetItem(args) {
+function cmdGetItemPostgres(args, backend) {
   require_(args, ['id']);
-  const row = queryJson(`SELECT row_to_json(t) FROM (SELECT * FROM backlog_items WHERE id = ${lit(args.id)}) t`);
+  const row = queryJson(`SELECT row_to_json(t) FROM (SELECT * FROM backlog_items WHERE id = ${lit(args.id)}) t`, backend);
   if (!row) fail(`not_found: ${args.id}`);
   const blocks = queryJson(`SELECT coalesce(json_agg(row_to_json(t)), '[]') FROM
-    (SELECT id, title, status, repo FROM backlog_items WHERE depends_on @> ARRAY[${lit(args.id)}]::text[]) t`);
+    (SELECT id, title, status, repo FROM backlog_items WHERE depends_on @> ARRAY[${lit(args.id)}]::text[]) t`, backend);
   return { ...withConsoleUrl(row), blocks };
 }
 
-function cmdSummarize(args) {
+function cmdSummarizePostgres(args, backend) {
   const conds = [];
-  for (const k of ['workstream', 'repo']) {
-    if (args[k] === '') fail(`--${k} must not be empty`);
-  }
+  for (const k of ['workstream', 'repo']) if (args[k] === '') fail(`--${k} must not be empty`);
   if (args.workstream) conds.push(`workstream = ${lit(args.workstream)}`);
   if (args.repo) conds.push(`repo = ${lit(args.repo)}`);
   const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
   return queryJson(`SELECT coalesce(json_agg(row_to_json(t)), '[]') FROM
     (SELECT workstream, status, count(*)::int AS count FROM backlog_items ${where}
-     GROUP BY workstream, status ORDER BY workstream, status) t`);
+     GROUP BY workstream, status ORDER BY workstream, status) t`, backend);
 }
 
-function cmdCreateItem(args) {
+function cmdCreateItemPostgres(args, backend) {
   require_(args, ['repo', 'workstream', 'title', 'type']);
   oneOf(args, 'type', TYPES);
   oneOf(args, 'priority', PRIORITIES);
-  if (!GITHUB_SLUG_REGEX.test(args.repo)) fail('--repo must be a full GitHub slug <org>/<repo> — run `tools/backlog list-repos` for the registered set');
+  if (!GITHUB_SLUG_REGEX.test(args.repo)) fail('--repo must be a full GitHub slug <org>/<repo> - run `tools/backlog list-repos` for the registered set');
   validateItemFields(args);
   if (args.id !== undefined && !ID_REGEX.test(args.id)) {
     fail('--id must match <short-slug>--<workstream>--<kebab-slug> (lowercase kebab)');
@@ -337,8 +427,8 @@ function cmdCreateItem(args) {
 
   let id = args.id;
   if (!id) {
-    const repoRow = queryJson(`SELECT row_to_json(t) FROM (SELECT short_slug FROM backlog_repos WHERE slug = ${lit(args.repo)}) t`);
-    if (!repoRow) fail(`repo "${args.repo}" is not registered — run \`tools/backlog list-repos\` or create-repo first`);
+    const repoRow = queryJson(`SELECT row_to_json(t) FROM (SELECT short_slug FROM backlog_repos WHERE slug = ${lit(args.repo)}) t`, backend);
+    if (!repoRow) fail(`repo "${args.repo}" is not registered - run \`tools/backlog list-repos\` or create-repo first`);
     id = `${repoRow.short_slug}--${slugify(args.workstream)}--${slugify(args.title)}`;
   }
   if (dependsOn.includes(id)) fail("self-reference: depends_on cannot contain the item's own id");
@@ -356,11 +446,11 @@ function cmdCreateItem(args) {
     aud AS (
       ${auditInsertSql('backlog_items', 'ins.id', 'create', 'NULL', 'row_to_json(ins)::jsonb', 'ins')}
     )
-    SELECT row_to_json(ins) FROM ins`);
+    SELECT row_to_json(ins) FROM ins`, backend);
   return withConsoleUrl(row);
 }
 
-function cmdUpdateItem(args) {
+function cmdUpdateItemPostgres(args, backend) {
   require_(args, ['id']);
   oneOf(args, 'status', STATUSES);
   oneOf(args, 'priority', PRIORITIES);
@@ -369,19 +459,9 @@ function cmdUpdateItem(args) {
   const dependsOn = args['depends-on'] !== undefined ? parseDependsOn(args['depends-on']) : undefined;
   if (dependsOn?.includes(args.id)) fail("self-reference: depends_on cannot contain the item's own id");
 
-  // Entity-layer rules replicated from actions-internal.ts:
-  if (args.status === 'blocked' && !(args['blocked-reason'] || '').trim()) fail('status=blocked requires a non-empty --blocked-reason');
-  if (args.status === 'abandoned' && !(args['abandoned-reason'] || '').trim()) fail('status=abandoned requires a non-empty --abandoned-reason');
-
-  const before = queryJson(`SELECT row_to_json(t) FROM (SELECT * FROM backlog_items WHERE id = ${lit(args.id)}) t`);
+  const before = queryJson(`SELECT row_to_json(t) FROM (SELECT * FROM backlog_items WHERE id = ${lit(args.id)}) t`, backend);
   if (!before) fail(`not_found: ${args.id}`);
-
-  const resultingStatus = args.status ?? before.status;
-  const resultingBranch = args.branch !== undefined ? args.branch : before.branch;
-  const resultingNote = args['progress-note'] !== undefined ? args['progress-note'] : before.progress_note;
-  if (resultingStatus === 'in_progress' && !(resultingBranch || '').trim() && !(resultingNote || '').trim()) {
-    fail('in_progress requires either --branch or --progress-note (recovery signal)');
-  }
+  validateBacklogWriteTransition(before, args);
 
   const sets = ['updated_at = now()'];
   if (args.status !== undefined) sets.push(`status = ${lit(args.status)}`);
@@ -394,7 +474,6 @@ function cmdUpdateItem(args) {
   if (args['progress-note'] !== undefined) sets.push(`progress_note = ${lit(args['progress-note'])}`);
   if (args['due-date'] !== undefined) sets.push(`due_date = ${lit(args['due-date'])}`);
 
-  // Reason fields: persist on matching status; clear when leaving via another status.
   if (args.status === 'blocked') sets.push(`blocked_reason = ${lit(args['blocked-reason'])}`);
   else if (args.status !== undefined) sets.push('blocked_reason = NULL');
   else if (args['blocked-reason'] !== undefined) sets.push(`blocked_reason = ${lit(args['blocked-reason'])}`);
@@ -412,58 +491,751 @@ function cmdUpdateItem(args) {
     aud AS (
       ${auditInsertSql('backlog_items', 'upd.id', 'update', jsonbLit(before), 'row_to_json(upd)::jsonb', 'upd')}
     )
-    SELECT row_to_json(upd) FROM upd`);
-  if (!row) fail(`conflict: ${args.id} disappeared between read and write — retry`);
+    SELECT row_to_json(upd) FROM upd`, backend);
+  if (!row) fail(`conflict: ${args.id} disappeared between read and write - retry`);
   return withConsoleUrl(row);
 }
 
-// --- main ----------------------------------------------------------------------
-const commands = {
-  'list-repos': { fn: cmdListRepos, flags: [] },
-  'create-repo': { fn: cmdCreateRepo, flags: ['slug', 'short-slug', 'display-name', 'default-branch', 'color'] },
-  'list-items': { fn: cmdListItems, flags: ['repo', 'workstream', 'status', 'type', 'priority', 'q', 'limit', 'offset'] },
-  'get-item': { fn: cmdGetItem, flags: ['id'] },
-  'summarize': { fn: cmdSummarize, flags: ['workstream', 'repo'] },
-  'create-item': { fn: cmdCreateItem, flags: ['repo', 'workstream', 'title', 'type', 'body', 'priority', 'source-context', 'depends-on', 'branch', 'progress-note', 'due-date', 'links', 'id'] },
-  'update-item': { fn: cmdUpdateItem, flags: ['id', 'status', 'priority', 'title', 'body', 'blocked-reason', 'abandoned-reason', 'depends-on', 'branch', 'progress-note', 'due-date', 'links'] },
+// --- GitHub helpers -----------------------------------------------------------
+function githubIdFor(repoSlug, issueNumber) {
+  if (!GITHUB_SLUG_REGEX.test(repoSlug)) fail('repo must be a full GitHub slug <org>/<repo>');
+  const [owner, repo] = repoSlug.split('/');
+  const n = Number(issueNumber);
+  if (!Number.isInteger(n) || n <= 0) fail('issue number must be a positive integer');
+  return `${owner.toLowerCase()}--${repo.toLowerCase()}--${n}`;
+}
+
+function parseGithubId(id) {
+  const first = id.indexOf('--');
+  const last = id.lastIndexOf('--');
+  if (first <= 0 || last <= first + 2) fail(`bad github issue id: ${id}`);
+  const owner = id.slice(0, first);
+  const repo = id.slice(first + 2, last);
+  const numberText = id.slice(last + 2);
+  if (!/^[a-z0-9._-]+$/.test(owner) || !/^[a-z0-9._-]+(?:--[a-z0-9._-]+)*$/.test(repo) || !/^[1-9][0-9]*$/.test(numberText)) {
+    fail(`bad github issue id: ${id}`);
+  }
+  return { owner, repo, issueNumber: Number(numberText), repoSlug: `${owner}/${repo}` };
+}
+
+function parseFrontmatter(body) {
+  if (!body.startsWith('---\n')) return { meta: {}, body, rawKeys: [] };
+  const lines = body.split('\n');
+  let endLine = -1;
+  for (let i = 1; i < lines.length; i++) {
+    if (lines[i] === '---') {
+      endLine = i;
+      break;
+    }
+  }
+  if (endLine === -1) return { meta: {}, body, rawKeys: [] };
+  const raw = lines.slice(1, endLine).join('\n');
+  const humanBody = lines.slice(endLine + 1).join('\n').replace(/^\n/, '');
+  const meta = {};
+  const rawKeys = [];
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue;
+    const idx = line.indexOf(':');
+    if (idx <= 0) fail(`invalid backlog frontmatter line: ${line}`);
+    const key = line.slice(0, idx).trim();
+    const valueText = line.slice(idx + 1).trim();
+    try {
+      meta[key] = JSON.parse(valueText);
+    } catch (e) {
+      fail(`invalid JSON literal for frontmatter key ${key}: ${e.message}`);
+    }
+    rawKeys.push(key);
+  }
+  return { meta, body: humanBody, rawKeys };
+}
+
+function formatFrontmatter(meta, body) {
+  const lines = ['---'];
+  for (const key of Object.keys(meta)) lines.push(`${key}: ${JSON.stringify(meta[key])}`);
+  lines.push('---');
+  if (body) lines.push('', body.replace(/^\n/, ''));
+  else lines.push('');
+  return lines.join('\n');
+}
+
+function githubToken(backend) {
+  const envName = backend.tokenEnv || 'GITHUB_TOKEN';
+  const token = process.env[envName];
+  if (!token) die(`${envName} is not set for github-issues backend ${backend.name}`);
+  return token;
+}
+
+async function githubRequest(backend, method, pathName, { query, body, apiVersion } = {}) {
+  if (typeof fetch !== 'function') die('github-issues backend requires Node 18 or newer with fetch support');
+  const base = backend.apiBaseUrl || 'https://api.github.com';
+  const url = new URL(pathName, base);
+  for (const [k, v] of Object.entries(query || {})) {
+    if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
+  }
+  let res;
+  try {
+    res = await fetch(url, {
+      method,
+      headers: {
+        Accept: 'application/vnd.github+json',
+        Authorization: `Bearer ${githubToken(backend)}`,
+        'X-GitHub-Api-Version': apiVersion || backend.apiVersion || DEFAULT_GITHUB_API_VERSION,
+        ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+  } catch (e) {
+    die(`github ${method} ${pathName} failed: ${e.message}`);
+  }
+  const text = await res.text();
+  let json = null;
+  try { json = text ? JSON.parse(text) : null; } catch { json = text; }
+  if (!res.ok) {
+    const err = new Error(`github ${method} ${pathName} failed (${res.status}): ${json?.message || text || res.statusText}`);
+    err.status = res.status;
+    err.json = json;
+    throw err;
+  }
+  return { json, headers: res.headers };
+}
+
+async function githubPaginate(backend, pathName, arrayKey, query = {}) {
+  const rows = [];
+  for (let page = 1; page <= Number(backend.pageCap || 10); page++) {
+    const { json } = await githubRequest(backend, 'GET', pathName, { query: { ...query, per_page: 100, page } });
+    const pageRows = arrayKey ? json?.[arrayKey] : json;
+    if (!Array.isArray(pageRows) || !pageRows.length) break;
+    rows.push(...pageRows);
+    if (pageRows.length < 100) break;
+  }
+  return rows;
+}
+
+const GITHUB_BACKLOG_LABELS = [
+  ['backlog', '5319e7', 'Managed by backlog CLI'],
+  ['backlog/status:queued', 'd4c5f9', 'Backlog status: queued'],
+  ['backlog/status:in_progress', 'fbca04', 'Backlog status: in progress'],
+  ['backlog/status:blocked', 'd73a4a', 'Backlog status: blocked'],
+  ['backlog/status:done', '0e8a16', 'Backlog status: done'],
+  ['backlog/status:abandoned', '6a737d', 'Backlog status: abandoned'],
+  ['backlog/priority:p0', 'b60205', 'Backlog priority: p0'],
+  ['backlog/priority:p1', 'd93f0b', 'Backlog priority: p1'],
+  ['backlog/priority:p2', 'fbca04', 'Backlog priority: p2'],
+  ['backlog/priority:p3', 'c5def5', 'Backlog priority: p3'],
+  ['backlog/type:engineering', '1d76db', 'Backlog type: engineering'],
+  ['backlog/type:spec_pending_impl', '5319e7', 'Backlog type: spec pending implementation'],
+  ['backlog/type:wiki_ops', '006b75', 'Backlog type: wiki ops'],
+].map(([name, color, description]) => ({ name, color, description }));
+
+function labelName(label) {
+  return typeof label === 'string' ? label : label?.name;
+}
+
+function labelNames(issue) {
+  return new Set((issue.labels || []).map(labelName).filter(Boolean));
+}
+
+function githubLabelsFor(row) {
+  return ['backlog', `backlog/status:${row.status}`, `backlog/priority:${row.priority}`, `backlog/type:${row.type}`];
+}
+
+function splitRepoSlug(slug) {
+  if (!GITHUB_SLUG_REGEX.test(slug)) fail('--repo must be a full GitHub slug <org>/<repo>');
+  return slug.split('/');
+}
+
+function repoSlugFromIssue(issue, fallback) {
+  if (issue.repository?.full_name) return issue.repository.full_name;
+  if (issue.repository_url) {
+    const m = issue.repository_url.match(/\/repos\/([^/]+)\/([^/]+)$/);
+    if (m) return `${m[1]}/${m[2]}`;
+  }
+  return fallback;
+}
+
+function repoColor(fullName) {
+  let hash = 0;
+  for (const ch of fullName.toLowerCase()) hash = ((hash * 31) + ch.charCodeAt(0)) >>> 0;
+  return REPO_PALETTE[hash % REPO_PALETTE.length];
+}
+
+function githubRepoRow(repo) {
+  const [owner, name] = repo.full_name.split('/');
+  return {
+    slug: repo.full_name,
+    short_slug: `${owner.toLowerCase()}--${name.toLowerCase()}`,
+    display_name: repo.name || name,
+    default_branch: repo.default_branch || 'main',
+    color: repoColor(repo.full_name),
+    created_at: repo.created_at || null,
+    html_url: repo.html_url,
+  };
+}
+
+async function ensureGithubLabel(backend, owner, repo, label) {
+  try {
+    await githubRequest(backend, 'POST', `/repos/${owner}/${repo}/labels`, { body: label });
+  } catch (e) {
+    if (e.status === 422) return;
+    throw e;
+  }
+}
+
+async function ensureGithubLabels(backend, owner, repo) {
+  if (backend.skipEnsureLabels) return;
+  for (const label of GITHUB_BACKLOG_LABELS) await ensureGithubLabel(backend, owner, repo, label);
+}
+
+const githubCapabilityCache = new Map();
+
+function capabilityKey(backend, owner, repo, name) {
+  return `${backend.name || 'github'}:${owner.toLowerCase()}/${repo.toLowerCase()}:${name}`;
+}
+
+function capabilityEnabled(backend, owner, repo, name) {
+  return githubCapabilityCache.get(capabilityKey(backend, owner, repo, name)) !== false;
+}
+
+function markCapabilityUnavailable(backend, owner, repo, name) {
+  githubCapabilityCache.set(capabilityKey(backend, owner, repo, name), false);
+}
+
+function configuredGithubIssueFields(backend) {
+  return backend.features?.issueFields || backend.features?.customFields || {};
+}
+
+function normalizeGithubIssueFieldValue(field, value) {
+  const dataType = field.dataType || 'text';
+  if (!['text', 'single_select', 'number', 'date'].includes(dataType)) return undefined;
+  if (value === undefined || value === null || value === '') return undefined;
+  const mapped = field.optionMap?.[value] ?? value;
+  if (dataType === 'number') {
+    const n = Number(mapped);
+    return Number.isFinite(n) ? n : undefined;
+  }
+  return String(mapped);
+}
+
+function decodeGithubIssueFieldValue(field, fieldValue) {
+  if (!fieldValue) return undefined;
+  let value = fieldValue.single_select_option?.name ?? fieldValue.value;
+  if (value === undefined || value === null) return undefined;
+  value = String(value);
+  if (field.optionMap) {
+    for (const [backlogValue, githubValue] of Object.entries(field.optionMap)) {
+      if (String(githubValue) === value) return backlogValue;
+    }
+  }
+  return value;
+}
+
+async function getGithubIssueFieldValues(backend, owner, repo, issueNumber) {
+  if (!Object.keys(configuredGithubIssueFields(backend)).length) return [];
+  if (!capabilityEnabled(backend, owner, repo, 'issueFields')) return [];
+  try {
+    const { json } = await githubRequest(backend, 'GET', `/repos/${owner}/${repo}/issues/${issueNumber}/issue-field-values`);
+    return Array.isArray(json) ? json : [];
+  } catch (e) {
+    markCapabilityUnavailable(backend, owner, repo, 'issueFields');
+    return [];
+  }
+}
+
+async function probeGithubIssueFields(backend, owner, repo) {
+  if (!Object.keys(configuredGithubIssueFields(backend)).length) return false;
+  if (!capabilityEnabled(backend, owner, repo, 'issueFields')) return false;
+  try {
+    await githubRequest(backend, 'GET', `/orgs/${owner}/issue-fields`);
+    return true;
+  } catch (e) {
+    markCapabilityUnavailable(backend, owner, repo, 'issueFields');
+    return false;
+  }
+}
+
+async function tryGithubIssueFields(backend, owner, repo, issueNumber, fieldValues) {
+  const configured = configuredGithubIssueFields(backend);
+  const issue_field_values = [];
+  for (const [name, value] of Object.entries(fieldValues)) {
+    const field = configured[name];
+    const mappedValue = field ? normalizeGithubIssueFieldValue(field, value) : undefined;
+    if (field?.fieldId !== undefined && mappedValue !== undefined) {
+      issue_field_values.push({ field_id: Number(field.fieldId), value: mappedValue });
+    }
+  }
+  if (!issue_field_values.length || !capabilityEnabled(backend, owner, repo, 'issueFields')) return false;
+  try {
+    await githubRequest(backend, 'POST', `/repos/${owner}/${repo}/issues/${issueNumber}/issue-field-values`, {
+      body: { issue_field_values },
+    });
+    return true;
+  } catch (e) {
+    markCapabilityUnavailable(backend, owner, repo, 'issueFields');
+    return false;
+  }
+}
+
+function githubTypeName(backend, backlogType) {
+  return backend.features?.issueTypes?.[backlogType];
+}
+
+function backlogTypeFromGithubType(backend, type) {
+  const name = typeof type === 'string' ? type : type?.name;
+  if (!name) return undefined;
+  for (const [backlogType, githubName] of Object.entries(backend.features?.issueTypes || {})) {
+    if (githubName === name) return backlogType;
+  }
+  return undefined;
+}
+
+function fieldValueByConfiguredName(backend, fieldValues, name) {
+  const field = configuredGithubIssueFields(backend)[name];
+  if (!field?.fieldId) return undefined;
+  const found = fieldValues.find((v) => Number(v.issue_field_id) === Number(field.fieldId));
+  return decodeGithubIssueFieldValue(field, found);
+}
+
+function reconcileGithubStatus(issue, meta) {
+  const labels = labelNames(issue);
+  if (issue.state === 'closed') {
+    return labels.has('backlog/status:abandoned') ? 'abandoned' : 'done';
+  }
+  for (const status of STATUSES) if (labels.has(`backlog/status:${status}`)) return status;
+  return STATUSES.includes(meta.status) ? meta.status : 'queued';
+}
+
+function reconcileGithubPriority(issue, meta, backend, fieldValues) {
+  const labels = labelNames(issue);
+  for (const p of PRIORITIES) if (labels.has(`backlog/priority:${p}`)) return p;
+  const fieldPriority = fieldValueByConfiguredName(backend, fieldValues, 'priority');
+  if (PRIORITIES.includes(fieldPriority)) return fieldPriority;
+  return PRIORITIES.includes(meta.priority) ? meta.priority : 'p2';
+}
+
+function reconcileGithubType(issue, meta, backend) {
+  const nativeType = backlogTypeFromGithubType(backend, issue.type);
+  if (nativeType) return nativeType;
+  const labels = labelNames(issue);
+  for (const t of TYPES) if (labels.has(`backlog/type:${t}`)) return t;
+  return TYPES.includes(meta.type) ? meta.type : 'engineering';
+}
+
+async function githubIssueToBacklogItem(backend, issue, repoSlug, fieldValues = null) {
+  if (issue.pull_request) die(`not_backlog_item: ${repoSlug}#${issue.number} is a pull request`);
+  if (!issue.labels?.some((l) => labelName(l) === 'backlog')) die(`not_backlog_item: ${repoSlug}#${issue.number}`);
+  const [owner, repo] = repoSlug.split('/');
+  const fields = fieldValues ?? await getGithubIssueFieldValues(backend, owner, repo, issue.number);
+  const parsed = parseFrontmatter(issue.body || '');
+  const status = reconcileGithubStatus(issue, parsed.meta);
+  const workstreamField = fieldValueByConfiguredName(backend, fields, 'workstream');
+  const dueDateField = fieldValueByConfiguredName(backend, fields, 'due_date');
+  return {
+    id: githubIdFor(repoSlug, issue.number),
+    workstream: workstreamField || parsed.meta.workstream || 'default',
+    title: issue.title || '',
+    body: parsed.body || '',
+    status,
+    priority: reconcileGithubPriority(issue, parsed.meta, backend, fields),
+    type: reconcileGithubType(issue, parsed.meta, backend),
+    blocked_reason: parsed.meta.blocked_reason ?? null,
+    abandoned_reason: parsed.meta.abandoned_reason ?? null,
+    links: Array.isArray(parsed.meta.links) ? parsed.meta.links : [],
+    source_context: parsed.meta.source_context ?? null,
+    created_at: issue.created_at,
+    updated_at: issue.updated_at,
+    completed_at: status === 'done' ? issue.closed_at : null,
+    repo: parsed.meta.repo || repoSlug,
+    depends_on: Array.isArray(parsed.meta.depends_on) ? parsed.meta.depends_on : [],
+    branch: parsed.meta.branch ?? null,
+    progress_note: parsed.meta.progress_note ?? null,
+    due_date: dueDateField || parsed.meta.due_date || null,
+    console_url: issue.html_url,
+  };
+}
+
+function metadataForRow(row) {
+  return {
+    backlog_schema: 1,
+    repo: row.repo,
+    workstream: row.workstream,
+    status: row.status,
+    priority: row.priority,
+    type: row.type,
+    depends_on: row.depends_on || [],
+    links: row.links || [],
+    source_context: row.source_context ?? null,
+    blocked_reason: row.blocked_reason ?? null,
+    abandoned_reason: row.abandoned_reason ?? null,
+    branch: row.branch ?? null,
+    progress_note: row.progress_note ?? null,
+    due_date: row.due_date ?? null,
+  };
+}
+
+function issuePatchForRow(backend, row, includeTitle = true) {
+  const body = {
+    body: formatFrontmatter(metadataForRow(row), row.body || ''),
+    labels: githubLabelsFor(row),
+    state: row.status === 'done' || row.status === 'abandoned' ? 'closed' : 'open',
+  };
+  if (includeTitle) body.title = row.title;
+  if (row.status === 'done') body.state_reason = 'completed';
+  if (row.status === 'abandoned') body.state_reason = 'not_planned';
+  const typeName = githubTypeName(backend, row.type);
+  if (typeName) body.type = typeName;
+  return body;
+}
+
+async function githubPatchIssueWithTypeFallback(backend, owner, repo, issueNumber, body) {
+  try {
+    return (await githubRequest(backend, 'PATCH', `/repos/${owner}/${repo}/issues/${issueNumber}`, { body })).json;
+  } catch (e) {
+    if (body.type !== undefined && (e.status === 400 || e.status === 404 || e.status === 422)) {
+      const fallback = { ...body };
+      delete fallback.type;
+      markCapabilityUnavailable(backend, owner, repo, 'issueTypes');
+      return (await githubRequest(backend, 'PATCH', `/repos/${owner}/${repo}/issues/${issueNumber}`, { body: fallback })).json;
+    }
+    throw e;
+  }
+}
+
+async function githubCreateIssueWithTypeFallback(backend, owner, repo, body) {
+  try {
+    return (await githubRequest(backend, 'POST', `/repos/${owner}/${repo}/issues`, { body })).json;
+  } catch (e) {
+    if (body.type !== undefined && (e.status === 400 || e.status === 404 || e.status === 422)) {
+      const fallback = { ...body };
+      delete fallback.type;
+      markCapabilityUnavailable(backend, owner, repo, 'issueTypes');
+      return (await githubRequest(backend, 'POST', `/repos/${owner}/${repo}/issues`, { body: fallback })).json;
+    }
+    throw e;
+  }
+}
+
+async function getGithubBlockedBy(backend, owner, repo, issueNumber) {
+  if (!capabilityEnabled(backend, owner, repo, 'issueDependencies')) return null;
+  try {
+    return await githubPaginate(backend, `/repos/${owner}/${repo}/issues/${issueNumber}/dependencies/blocked_by`, null);
+  } catch (e) {
+    markCapabilityUnavailable(backend, owner, repo, 'issueDependencies');
+    return null;
+  }
+}
+
+async function getGithubBlocking(backend, owner, repo, issueNumber) {
+  if (!capabilityEnabled(backend, owner, repo, 'issueDependencies')) return null;
+  try {
+    return await githubPaginate(backend, `/repos/${owner}/${repo}/issues/${issueNumber}/dependencies/blocking`, null);
+  } catch (e) {
+    markCapabilityUnavailable(backend, owner, repo, 'issueDependencies');
+    return null;
+  }
+}
+
+async function syncGithubBlockedBy(backend, owner, repo, issueNumber, dependsOn) {
+  const current = await getGithubBlockedBy(backend, owner, repo, issueNumber);
+  if (current === null) return false;
+  try {
+    const wanted = new Map();
+    for (const id of dependsOn) {
+      const dep = parseGithubId(id);
+      const issue = (await githubRequest(backend, 'GET', `/repos/${dep.owner}/${dep.repo}/issues/${dep.issueNumber}`)).json;
+      wanted.set(Number(issue.id), issue);
+    }
+    const currentIds = new Set(current.map((i) => Number(i.id)));
+    for (const [issueId] of wanted) {
+      if (!currentIds.has(issueId)) {
+        await githubRequest(backend, 'POST', `/repos/${owner}/${repo}/issues/${issueNumber}/dependencies/blocked_by`, {
+          body: { issue_id: issueId },
+        });
+      }
+    }
+    for (const issue of current) {
+      const issueId = Number(issue.id);
+      if (!wanted.has(issueId)) {
+        await githubRequest(backend, 'DELETE', `/repos/${owner}/${repo}/issues/${issueNumber}/dependencies/blocked_by/${issueId}`);
+      }
+    }
+    return true;
+  } catch (e) {
+    markCapabilityUnavailable(backend, owner, repo, 'issueDependencies');
+    return false;
+  }
+}
+
+// --- GitHub commands ----------------------------------------------------------
+async function cmdListReposGithub(args, backend) {
+  const pathName = backend.tokenType === 'app-installation' ? '/installation/repositories' : '/user/repos';
+  const repos = await githubPaginate(backend, pathName, backend.tokenType === 'app-installation' ? 'repositories' : null);
+  return repos.map(githubRepoRow).sort((a, b) => a.slug.localeCompare(b.slug));
+}
+
+async function cmdCreateRepoGithub(args, backend) {
+  require_(args, ['slug']);
+  const [owner, repo] = splitRepoSlug(args.slug);
+  const repoJson = (await githubRequest(backend, 'GET', `/repos/${owner}/${repo}`)).json;
+  await ensureGithubLabels(backend, owner, repo);
+  const row = githubRepoRow(repoJson);
+  if (Object.keys(configuredGithubIssueFields(backend)).length) {
+    row.github_capabilities = {
+      issueFields: await probeGithubIssueFields(backend, owner, repo),
+    };
+  }
+  return row;
+}
+
+async function cmdCreateItemGithub(args, backend) {
+  require_(args, ['repo', 'workstream', 'title', 'type']);
+  oneOf(args, 'type', TYPES);
+  oneOf(args, 'priority', PRIORITIES);
+  if (args.id !== undefined) fail('--id is not supported by github-issues backends because GitHub assigns issue numbers');
+  validateItemFields(args);
+  const [owner, repo] = splitRepoSlug(args.repo);
+  const links = parseLinks(args) ?? [];
+  const dependsOn = args['depends-on'] !== undefined ? parseDependsOn(args['depends-on'], true) : [];
+  const row = {
+    repo: args.repo,
+    workstream: args.workstream,
+    title: args.title,
+    body: args.body || '',
+    status: 'queued',
+    priority: args.priority || 'p2',
+    type: args.type,
+    blocked_reason: null,
+    abandoned_reason: null,
+    links,
+    source_context: args['source-context'] ?? null,
+    depends_on: dependsOn,
+    branch: args.branch ?? null,
+    progress_note: args['progress-note'] ?? null,
+    due_date: args['due-date'] ?? null,
+  };
+  await ensureGithubLabels(backend, owner, repo);
+  const createBody = issuePatchForRow(backend, row, true);
+  delete createBody.state;
+  delete createBody.state_reason;
+  const issue = await githubCreateIssueWithTypeFallback(backend, owner, repo, createBody);
+  await tryGithubIssueFields(backend, owner, repo, issue.number, {
+    priority: row.priority,
+    status: row.status,
+    workstream: row.workstream,
+    due_date: row.due_date,
+  });
+  if (dependsOn.length) await syncGithubBlockedBy(backend, owner, repo, issue.number, dependsOn);
+  return githubIssueToBacklogItem(backend, issue, args.repo, []);
+}
+
+async function cmdGetItemGithub(args, backend) {
+  require_(args, ['id']);
+  const parsed = parseGithubId(args.id);
+  const issue = (await githubRequest(backend, 'GET', `/repos/${parsed.owner}/${parsed.repo}/issues/${parsed.issueNumber}`)).json;
+  const row = await githubIssueToBacklogItem(backend, issue, parsed.repoSlug);
+  const nativeBlocks = await getGithubBlocking(backend, parsed.owner, parsed.repo, parsed.issueNumber);
+  let blocks = [];
+  if (nativeBlocks !== null) {
+    blocks = (await Promise.all(nativeBlocks.map(async (blocker) => {
+      const repoSlug = repoSlugFromIssue(blocker, parsed.repoSlug);
+      try {
+        const mapped = await githubIssueToBacklogItem(backend, blocker, repoSlug);
+        return { id: mapped.id, title: mapped.title, status: mapped.status, repo: mapped.repo };
+      } catch (e) {
+        if (String(e.message || '').startsWith('not_backlog_item:')) return null;
+        throw e;
+      }
+    }))).filter(Boolean);
+  } else {
+    const q = `type:issue label:backlog "${args.id}"`;
+    const candidates = await githubPaginate(backend, '/search/issues', 'items', { q });
+    const mapped = await Promise.all(candidates.map(async (candidate) => {
+      const repoSlug = repoSlugFromIssue(candidate, parsed.repoSlug);
+      try { return await githubIssueToBacklogItem(backend, candidate, repoSlug); } catch { return null; }
+    }));
+    blocks = mapped.filter((r) => r && r.depends_on.includes(args.id))
+      .map((r) => ({ id: r.id, title: r.title, status: r.status, repo: r.repo }));
+  }
+  return { ...row, blocks };
+}
+
+async function cmdUpdateItemGithub(args, backend) {
+  require_(args, ['id']);
+  oneOf(args, 'status', STATUSES);
+  oneOf(args, 'priority', PRIORITIES);
+  validateItemFields(args);
+  const links = parseLinks(args);
+  const dependsOn = args['depends-on'] !== undefined ? parseDependsOn(args['depends-on'], true) : undefined;
+  if (dependsOn?.includes(args.id)) fail("self-reference: depends_on cannot contain the item's own id");
+
+  const parsed = parseGithubId(args.id);
+  const issue = (await githubRequest(backend, 'GET', `/repos/${parsed.owner}/${parsed.repo}/issues/${parsed.issueNumber}`)).json;
+  const before = await githubIssueToBacklogItem(backend, issue, parsed.repoSlug);
+  validateBacklogWriteTransition(before, args);
+
+  const next = {
+    ...before,
+    title: args.title !== undefined ? args.title : before.title,
+    body: args.body !== undefined ? args.body : before.body,
+    status: args.status !== undefined ? args.status : before.status,
+    priority: args.priority !== undefined ? args.priority : before.priority,
+    links: links !== undefined ? links : before.links,
+    depends_on: dependsOn !== undefined ? dependsOn : before.depends_on,
+    branch: args.branch !== undefined ? args.branch : before.branch,
+    progress_note: args['progress-note'] !== undefined ? args['progress-note'] : before.progress_note,
+    due_date: args['due-date'] !== undefined ? args['due-date'] : before.due_date,
+  };
+  if (args.status === 'blocked') next.blocked_reason = args['blocked-reason'];
+  else if (args.status !== undefined) next.blocked_reason = null;
+  else if (args['blocked-reason'] !== undefined) next.blocked_reason = args['blocked-reason'];
+  if (args.status === 'abandoned') next.abandoned_reason = args['abandoned-reason'];
+  else if (args.status !== undefined) next.abandoned_reason = null;
+  else if (args['abandoned-reason'] !== undefined) next.abandoned_reason = args['abandoned-reason'];
+
+  if (dependsOn !== undefined) await syncGithubBlockedBy(backend, parsed.owner, parsed.repo, parsed.issueNumber, dependsOn);
+  const patched = await githubPatchIssueWithTypeFallback(backend, parsed.owner, parsed.repo, parsed.issueNumber, issuePatchForRow(backend, next, true));
+  await tryGithubIssueFields(backend, parsed.owner, parsed.repo, parsed.issueNumber, {
+    priority: next.priority,
+    status: next.status,
+    workstream: next.workstream,
+    due_date: next.due_date,
+  });
+  return githubIssueToBacklogItem(backend, patched, parsed.repoSlug, []);
+}
+
+async function cmdListItemsGithub(args, backend) {
+  oneOf(args, 'type', TYPES);
+  oneOf(args, 'priority', PRIORITIES);
+  for (const k of ['repo', 'workstream', 'status', 'type', 'priority', 'q']) {
+    if (args[k] === '') fail(`--${k} must not be empty`);
+  }
+  const issues = [];
+  if (args.repo) {
+    const [owner, repo] = splitRepoSlug(args.repo);
+    issues.push(...await githubPaginate(backend, `/repos/${owner}/${repo}/issues`, null, {
+      labels: 'backlog',
+      state: 'all',
+      sort: 'created',
+      direction: 'desc',
+    }));
+  } else {
+    const q = ['type:issue', 'label:backlog', args.q].filter(Boolean).join(' ');
+    issues.push(...await githubPaginate(backend, '/search/issues', 'items', { q }));
+  }
+  const mapped = [];
+  for (const issue of issues) {
+    const repoSlug = repoSlugFromIssue(issue, args.repo);
+    try {
+      mapped.push(await githubIssueToBacklogItem(backend, issue, repoSlug));
+    } catch (e) {
+      if (!String(e.message || '').startsWith('not_backlog_item:')) throw e;
+    }
+  }
+  const statusFilter = args.status ? new Set(args.status.split(',')) : null;
+  if (statusFilter) for (const s of statusFilter) if (!STATUSES.includes(s)) fail(`bad status "${s}"`);
+  let rows = mapped.filter((row) => {
+    if (statusFilter && !statusFilter.has(row.status)) return false;
+    if (args.priority && row.priority !== args.priority) return false;
+    if (args.type && row.type !== args.type) return false;
+    if (args.workstream && row.workstream !== args.workstream) return false;
+    if (args.q && args.repo) {
+      const q = args.q.toLowerCase();
+      if (!`${row.title}\n${row.body}`.toLowerCase().includes(q)) return false;
+    }
+    return true;
+  });
+  rows = rows.sort((a, b) => {
+    const p = PRIORITY_ORDER.get(a.priority) - PRIORITY_ORDER.get(b.priority);
+    if (p) return p;
+    return String(b.created_at || '').localeCompare(String(a.created_at || ''));
+  });
+  const offset = args.offset !== undefined ? intLit(args.offset, 'offset') : 0;
+  const limit = args.limit === 'all' ? rows.length : Math.min(args.limit !== undefined ? intLit(args.limit, 'limit') : 50, 500);
+  return rows.slice(offset, offset + limit);
+}
+
+async function cmdSummarizeGithub(args, backend) {
+  const rows = await cmdListItemsGithub({ ...args, limit: 'all', offset: 0 }, backend);
+  const counts = new Map();
+  for (const row of rows) {
+    const key = `${row.workstream}\0${row.status}`;
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+  return [...counts.entries()].map(([key, count]) => {
+    const [workstream, status] = key.split('\0');
+    return { workstream, status, count };
+  }).sort((a, b) => a.workstream.localeCompare(b.workstream) || a.status.localeCompare(b.status));
+}
+
+// --- adapters ----------------------------------------------------------------
+const postgresAdapter = {
+  type: 'postgres',
+  commands: {
+    'list-repos': { fn: cmdListReposPostgres, flags: [] },
+    'create-repo': { fn: cmdCreateRepoPostgres, flags: ['slug', 'short-slug', 'display-name', 'default-branch', 'color'] },
+    'list-items': { fn: cmdListItemsPostgres, flags: ['repo', 'workstream', 'status', 'type', 'priority', 'q', 'limit', 'offset'] },
+    'get-item': { fn: cmdGetItemPostgres, flags: ['id'] },
+    summarize: { fn: cmdSummarizePostgres, flags: ['workstream', 'repo'] },
+    'create-item': { fn: cmdCreateItemPostgres, flags: ['repo', 'workstream', 'title', 'type', 'body', 'priority', 'source-context', 'depends-on', 'branch', 'progress-note', 'due-date', 'links', 'id'] },
+    'update-item': { fn: cmdUpdateItemPostgres, flags: ['id', 'status', 'priority', 'title', 'body', 'blocked-reason', 'abandoned-reason', 'depends-on', 'branch', 'progress-note', 'due-date', 'links'] },
+  },
 };
 
+const githubAdapter = {
+  type: 'github-issues',
+  commands: {
+    'list-repos': { fn: cmdListReposGithub, flags: [] },
+    'create-repo': { fn: cmdCreateRepoGithub, flags: ['slug'] },
+    'list-items': { fn: cmdListItemsGithub, flags: ['repo', 'workstream', 'status', 'type', 'priority', 'q', 'limit', 'offset'] },
+    'get-item': { fn: cmdGetItemGithub, flags: ['id'] },
+    summarize: { fn: cmdSummarizeGithub, flags: ['workstream', 'repo'] },
+    'create-item': { fn: cmdCreateItemGithub, flags: ['repo', 'workstream', 'title', 'type', 'body', 'priority', 'source-context', 'depends-on', 'branch', 'progress-note', 'due-date', 'links', 'id'] },
+    'update-item': { fn: cmdUpdateItemGithub, flags: ['id', 'status', 'priority', 'title', 'body', 'blocked-reason', 'abandoned-reason', 'depends-on', 'branch', 'progress-note', 'due-date', 'links'] },
+  },
+};
+
+const adapters = new Map([
+  [postgresAdapter.type, postgresAdapter],
+  [githubAdapter.type, githubAdapter],
+]);
+
+// --- help --------------------------------------------------------------------
 const commandDocs = {
   'list-repos': `
 Usage: backlog list-repos
 
 Purpose:
-  Shows repositories registered for backlog item ownership. Run this first when
-  you do not know the exact --repo slug or short slug used in item IDs.
+  Shows repositories available to the selected backend. Postgres lists registered
+  backlog repositories. GitHub lists token-visible repositories.
 
 Flags:
   none
 
 Output:
-  JSON array of backlog_repos rows, ordered by slug.
+  JSON array of repository rows, ordered by slug.
 
 Examples:
   backlog list-repos
 `,
   'create-repo': `
-Usage: backlog create-repo --slug <org/repo> --short-slug <short> --display-name <name> [--default-branch <branch>] [--color <#RRGGBB>]
+Usage: backlog create-repo --slug <org/repo> [--short-slug <short> --display-name <name>] [--default-branch <branch>] [--color <#RRGGBB>]
 
 Purpose:
-  Registers a GitHub repository so backlog items can be assigned to it.
+  Postgres registers a repository for backlog ownership. GitHub enables backlog
+  labels in an existing repository and returns the shaped repository row.
 
 Flags:
   --slug <org/repo>            Full GitHub repository slug, for example GourmetPro/ai-tools.
-  --short-slug <short>         Lowercase kebab slug used as the first segment in item IDs.
-  --display-name <name>        Human-readable repository name.
-  --default-branch <branch>    Optional default branch. Defaults to main.
-  --color <#RRGGBB>            Optional repository color. If omitted, backlog picks an unused palette color.
+  --short-slug <short>         Postgres only. Lowercase kebab slug used in item IDs.
+  --display-name <name>        Postgres only. Human-readable repository name.
+  --default-branch <branch>    Postgres only. Defaults to main.
+  --color <#RRGGBB>            Postgres only. Optional repository color.
 
 Output:
-  JSON object for the created backlog_repos row.
+  JSON object for the created or enabled repository row.
 
 Examples:
   backlog create-repo --slug GourmetPro/ai-tools --short-slug ai-tools --display-name "ai-tools"
-  backlog create-repo --slug GourmetPro/app --short-slug app --display-name "Console" --default-branch main --color '#1A4D4A'
+  backlog --backend github create-repo --slug GourmetPro/ai-tools
 `,
   'list-items': `
 Usage: backlog list-items [--repo <org/repo>] [--workstream <name>] [--status <queued,in_progress,blocked,done,abandoned>] [--type <type>] [--priority <p0|p1|p2|p3>] [--q <text>] [--limit <n>] [--offset <n>]
@@ -473,17 +1245,17 @@ Purpose:
   Use it before creating duplicate work and before updating an item.
 
 Flags:
-  --repo <org/repo>       Filter to one registered GitHub repository.
+  --repo <org/repo>       Filter to one repository.
   --workstream <name>     Filter to one workstream.
   --status <csv>          Comma-separated statuses: queued,in_progress,blocked,done,abandoned.
   --type <type>           engineering, spec_pending_impl, or wiki_ops.
   --priority <priority>   p0, p1, p2, or p3.
-  --q <text>              Literal case-insensitive search over title and body.
+  --q <text>              Search over title/body. GitHub uses issue search when possible.
   --limit <n>             Non-negative integer, capped at 500. Defaults to 50.
   --offset <n>            Non-negative integer for pagination. Defaults to 0.
 
 Output:
-  JSON array of backlog_items rows. Each item includes console_url.
+  JSON array of backlog item rows.
 
 Examples:
   backlog list-items --repo GourmetPro/ai-tools --status queued,in_progress
@@ -497,7 +1269,8 @@ Purpose:
   Reads one backlog item by ID when you need the full record before acting.
 
 Flags:
-  --id <item-id>    Backlog item ID in <short-slug>--<workstream>--<kebab-title> form.
+  --id <item-id>    Postgres IDs use <short-slug>--<workstream>--<kebab-title>.
+                    GitHub IDs use <owner>--<repo>--<issue-number>.
 
 Output:
   JSON object for the backlog item, including console_url. Includes a blocks array
@@ -505,13 +1278,13 @@ Output:
 
 Examples:
   backlog get-item --id ai-tools--tooling--document-backlog-cli
+  backlog --backend github get-item --id gourmetpro--ai-tools--123
 `,
-  'summarize': `
+  summarize: `
 Usage: backlog summarize [--workstream <name>] [--repo <org/repo>]
 
 Purpose:
-  Counts backlog items by workstream and status. Use it for a quick state summary
-  before planning or choosing the next item.
+  Counts backlog items by workstream and status.
 
 Flags:
   --workstream <name>    Optional workstream filter.
@@ -529,24 +1302,22 @@ Examples:
 Usage: backlog create-item --repo <org/repo> --workstream <name> --title <text> --type engineering|spec_pending_impl|wiki_ops [--body <text>] [--priority p0|p1|p2|p3] [--source-context <text>] [--depends-on <id1,id2>] [--branch <branch>] [--progress-note <text>] [--due-date <YYYY-MM-DD>] [--links '<json array>'] [--id <item-id>]
 
 Purpose:
-  Creates a backlog item for work that should be tracked outside the current chat.
-  For AI agents, create items for durable follow-up tasks, blocked work, or work
-  discovered while operating in a repo.
+  Creates a backlog item for durable work tracking.
 
 Flags:
-  --repo <org/repo>           Registered GitHub repository slug. Use backlog list-repos first if unsure.
+  --repo <org/repo>           Repository slug.
   --workstream <name>         Workstream name, max 64 chars.
   --title <text>              Item title, max 200 chars.
   --type <type>               engineering, spec_pending_impl, or wiki_ops.
   --body <text>               Optional detailed description.
   --priority <priority>       p0, p1, p2, or p3. Defaults to p2.
-  --source-context <text>     Optional note about where this came from, such as a repo path, user request, or meeting.
+  --source-context <text>     Optional note about where this came from.
   --depends-on <id1,id2>      Optional comma-separated dependency item IDs.
   --branch <branch>           Optional working branch.
   --progress-note <text>      Optional progress or recovery note.
   --due-date <YYYY-MM-DD>     Optional due date.
   --links '<json array>'      Optional JSON array of related spec, brief, PR, commit, or URL links.
-  --id <item-id>              Optional explicit ID. Otherwise derived from repo short slug, workstream, and title.
+  --id <item-id>              Postgres only. GitHub assigns issue numbers and rejects --id.
 
 Output:
   JSON object for the created backlog item, including console_url.
@@ -592,21 +1363,21 @@ Examples:
 };
 
 const GENERAL_HELP = `
-Usage: backlog <command> [--flags]
+Usage: backlog [--backend <name>] <command> [--flags]
        backlog help <command>
        backlog <command> --help
 
 Purpose:
   Use this CLI when an AI or human needs to inspect or update the shared GourmetPro backlog
   from any terminal, including repos that do not contain the backlog source code.
-  The CLI mirrors the /mcp/backlog MCP tools and talks directly to the configured
-  Postgres database through psql.
+  The CLI mirrors the /mcp/backlog MCP tools and supports Postgres plus GitHub
+  Issues backends.
 
 Commands:
   list-repos
-      Show registered repositories and their short slugs.
+      Show repositories available to the selected backend.
   create-repo --slug <org/repo> --short-slug <short> --display-name <name>
-      Register a repository for backlog ownership.
+      Register a repository in Postgres, or enable labels for an existing GitHub repository.
   list-items [--repo <org/repo>] [--workstream <name>] [--status <csv>]
       Search backlog items with filters.
   get-item --id <item-id>
@@ -626,10 +1397,26 @@ AI workflow:
   5. Use update-item to record progress, branches, blockers, completion, and links.
 
 Configuration:
-  Reads DATABASE_URL from ~/.config/ai-tools/backlog.conf by default.
-  Set BACKLOG_CONFIG to use another config file.
-  Set BACKLOG_DATABASE_URL for a one-off session override.
-  The config file should contain: DATABASE_URL='postgres://user:pass@host/db'
+  Reads ~/.config/ai-tools/backlog.json by default.
+  Set --backend <name> to choose a backend for one command.
+  BACKLOG_BACKEND is a fallback backend selector for automation.
+  Old ~/.config/ai-tools/backlog.conf and BACKLOG_DATABASE_URL remain supported
+  for Postgres compatibility.
+
+  Example backlog.json:
+  {
+    "default": "gtm-console",
+    "backends": [
+      { "name": "gtm-console", "type": "postgres", "databaseUrlEnv": "BACKLOG_DATABASE_URL" },
+      { "name": "github", "type": "github-issues", "tokenEnv": "GITHUB_TOKEN" }
+    ]
+  }
+
+GitHub backend notes:
+  GitHub stores backlog metadata in issue labels, issue body frontmatter, native
+  issue dependencies, issue types, and configured issue fields when available.
+  Issue field mirroring uses GitHub's issue-only field API and preserves
+  unrelated human-managed fields.
 
 Output:
   Successful commands print pretty JSON to stdout.
@@ -653,6 +1440,10 @@ Try: backlog --help
 Try: backlog help <command>
 `.trim();
 
+function allCommands() {
+  return new Set([...Object.keys(postgresAdapter.commands), ...Object.keys(githubAdapter.commands)]);
+}
+
 function helpTextFor(command) {
   return (commandDocs[command] || GENERAL_HELP).trim();
 }
@@ -667,32 +1458,66 @@ function printUsageError(message) {
   process.exit(2);
 }
 
-const [cmd, ...rest] = process.argv.slice(2);
-if (!cmd || cmd === '-h' || cmd === '--help') {
-  if (!cmd) printUsageError();
-  printHelp();
-  process.exit(0);
-}
-if (cmd === 'help') {
-  if (rest.length > 1) printUsageError('usage: backlog help [command]');
-  const helpCommand = rest[0];
-  if (helpCommand && !commands[helpCommand]) {
-    printUsageError(`unknown command: ${helpCommand}`);
+// --- hidden test helpers ------------------------------------------------------
+function maybeRunTestHelper(cmd, rest) {
+  if (process.env.BACKLOG_TEST_HELPERS !== '1') return false;
+  if (cmd === '__test-github-id') {
+    const args = parseArgs(rest);
+    require_(args, ['repo', 'number']);
+    process.stdout.write(`${githubIdFor(args.repo, args.number)}\n`);
+    return true;
   }
-  printHelp(helpCommand);
-  process.exit(0);
-}
-if (!cmd || !commands[cmd]) {
-  printUsageError(`unknown command: ${cmd}`);
-}
-if (rest.includes('-h') || rest.includes('--help')) {
-  printHelp(cmd);
-  process.exit(0);
-}
-const args = parseArgs(rest);
-for (const k of Object.keys(args)) {
-  if (!commands[cmd].flags.includes(k)) {
-    fail(`unknown flag --${k} for ${cmd} (allowed: ${commands[cmd].flags.map((f) => '--' + f).join(' ') || 'none'})`);
+  if (cmd === '__test-frontmatter-roundtrip') {
+    const args = parseArgs(rest);
+    require_(args, ['file', 'set']);
+    const parsed = parseFrontmatter(fs.readFileSync(args.file, 'utf8'));
+    let updates;
+    try { updates = JSON.parse(args.set); } catch (e) { fail(`--set is not valid JSON: ${e.message}`); }
+    process.stdout.write(formatFrontmatter({ ...parsed.meta, ...updates }, parsed.body));
+    return true;
   }
+  return false;
 }
-console.log(JSON.stringify(commands[cmd].fn(args), null, 2));
+
+// --- main --------------------------------------------------------------------
+async function main() {
+  const parsedGlobal = parseGlobalArgs(process.argv.slice(2));
+  const [cmd, ...rest] = parsedGlobal.rest;
+  const commands = allCommands();
+  if (!cmd || cmd === '-h' || cmd === '--help') {
+    if (!cmd) printUsageError();
+    printHelp();
+    return;
+  }
+  if (maybeRunTestHelper(cmd, rest)) return;
+  if (cmd === 'help') {
+    if (rest.length > 1) printUsageError('usage: backlog help [command]');
+    const helpCommand = rest[0];
+    if (helpCommand && !commands.has(helpCommand)) printUsageError(`unknown command: ${helpCommand}`);
+    printHelp(helpCommand);
+    return;
+  }
+  if (!commands.has(cmd)) printUsageError(`unknown command: ${cmd}`);
+  if (rest.includes('-h') || rest.includes('--help')) {
+    printHelp(cmd);
+    return;
+  }
+
+  const backend = selectBackendConfig(parsedGlobal.globals);
+  const adapter = adapters.get(backend.type);
+  if (!adapter) fail(`unsupported backend type "${backend.type}" for backend ${backend.name}`);
+  const command = adapter.commands[cmd];
+  if (!command) fail(`command ${cmd} is not supported by backend ${backend.name}`);
+  const args = parseArgs(rest);
+  for (const k of Object.keys(args)) {
+    if (!command.flags.includes(k)) {
+      fail(`unknown flag --${k} for ${cmd} (allowed: ${command.flags.map((f) => '--' + f).join(' ') || 'none'})`);
+    }
+  }
+  const result = await command.fn(args, backend);
+  console.log(JSON.stringify(result, null, 2));
+}
+
+main().catch((e) => {
+  fail(e && e.message ? e.message : String(e));
+});

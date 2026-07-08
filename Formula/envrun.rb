@@ -1,3 +1,6 @@
+# frozen_string_literal: true
+
+# Homebrew formula for the envrun environment loader.
 class Envrun < Formula
   desc "Run commands with local env files exported"
   homepage "https://github.com/GourmetPro/ai-tools"

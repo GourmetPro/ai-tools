@@ -1,3 +1,6 @@
+# frozen_string_literal: true
+
+# Homebrew formula for the backlog CLI.
 class Backlog < Formula
   desc "Database-backed backlog CLI"
   homepage "https://github.com/GourmetPro/ai-tools"
@@ -23,12 +26,20 @@ class Backlog < Formula
     <<~EOS
       Configure backlog before first use:
         mkdir -p ~/.config/ai-tools
-        $EDITOR ~/.config/ai-tools/backlog.conf
+        $EDITOR ~/.config/ai-tools/backlog.json
 
-      The config file should contain:
-        DATABASE_URL='postgres://user:pass@host/db'
+      Example config:
+        {
+          "default": "gtm-console",
+          "backends": [
+            { "name": "gtm-console", "type": "postgres", "databaseUrlEnv": "BACKLOG_DATABASE_URL" },
+            { "name": "github", "type": "github-issues", "tokenEnv": "GITHUB_TOKEN" }
+          ]
+        }
 
-      You can also point at another config file with BACKLOG_CONFIG.
+      You can choose a backend with --backend or BACKLOG_BACKEND.
+      Existing ~/.config/ai-tools/backlog.conf files remain supported for
+      Postgres compatibility when no backlog.json exists.
     EOS
   end
 

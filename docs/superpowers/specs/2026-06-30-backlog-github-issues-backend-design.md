@@ -67,7 +67,36 @@ Example:
       "name": "github",
       "type": "github-issues",
       "tokenEnv": "GITHUB_TOKEN",
-      "apiBaseUrl": "https://api.github.com"
+      "apiBaseUrl": "https://api.github.com",
+      "apiVersion": "2026-03-10",
+      "features": {
+        "issueDependencies": "auto",
+        "issueTypes": {
+          "engineering": "Engineering",
+          "spec_pending_impl": "Spec pending implementation",
+          "wiki_ops": "Wiki ops"
+        },
+        "issueFields": {
+          "priority": {
+            "fieldId": 12345,
+            "dataType": "single_select",
+            "optionMap": { "p0": "P0", "p1": "P1", "p2": "P2", "p3": "P3" }
+          },
+          "status": {
+            "fieldId": 12346,
+            "dataType": "single_select",
+            "optionMap": {
+              "queued": "Queued",
+              "in_progress": "In progress",
+              "blocked": "Blocked",
+              "done": "Done",
+              "abandoned": "Abandoned"
+            }
+          },
+          "workstream": { "fieldId": 12347, "dataType": "text" },
+          "due_date": { "fieldId": 12348, "dataType": "date" }
+        }
+      }
     },
     {
       "name": "gtm-console",
@@ -96,6 +125,11 @@ Both backends support env-var indirection for secrets:
 
 Literal `databaseUrl` remains supported for local setups, but docs should
 prefer `databaseUrlEnv`.
+
+`features.issueFields` is the canonical GitHub issue field configuration name.
+During migration, the implementation may accept `features.customFields` as a
+backward-compatible alias, but new config and documentation should use
+`issueFields`.
 
 ## Architecture
 
@@ -149,7 +183,9 @@ Requests use GitHub REST API conventions:
 
 - `Accept: application/vnd.github+json`
 - `Authorization: Bearer <token>`
-- `X-GitHub-Api-Version: 2022-11-28` unless overridden by config
+- `X-GitHub-Api-Version: 2026-03-10` unless overridden by config. This is the
+  first version used by this design because issue fields are part of the backend
+  contract.
 
 The default `apiBaseUrl` is `https://api.github.com`. This keeps the door open
 for GitHub Enterprise by changing config.
@@ -165,6 +201,103 @@ If omitted, the adapter starts with the PAT/fine-grained PAT path and reports a
 clear error if the token shape is unsupported. Creating or updating issues
 requires issue write permission. `create-repo` label bootstrapping also requires
 permission to create repository labels.
+
+### Capability Detection
+
+GitHub has native issue capabilities that vary by organization, repository,
+token, and feature configuration. The adapter uses capability detection and
+graceful fallback instead of assuming every repository supports every native
+feature.
+
+Supported capabilities:
+
+- Native issue dependencies: `blocked_by` and `blocking` endpoints.
+- Native issue type: issue `type` field on create/update.
+- Native issue fields: organization issue fields under
+  `/orgs/{org}/issue-fields` and per-issue values under
+  `/repos/{owner}/{repo}/issues/{issue_number}/issue-field-values` for
+  configured field IDs.
+
+Configuration:
+
+```json
+{
+  "features": {
+    "issueDependencies": "auto",
+    "issueTypes": {
+      "engineering": "Engineering",
+      "spec_pending_impl": "Spec pending implementation",
+      "wiki_ops": "Wiki ops"
+    },
+    "issueFields": {
+      "priority": {
+        "fieldId": 12345,
+        "dataType": "single_select",
+        "optionMap": { "p0": "P0", "p1": "P1", "p2": "P2", "p3": "P3" }
+      },
+      "status": {
+        "fieldId": 12346,
+        "dataType": "single_select",
+        "optionMap": {
+          "queued": "Queued",
+          "in_progress": "In progress",
+          "blocked": "Blocked",
+          "done": "Done",
+          "abandoned": "Abandoned"
+        }
+      },
+      "workstream": { "fieldId": 12347, "dataType": "text" },
+      "due_date": { "fieldId": 12348, "dataType": "date" }
+    }
+  }
+}
+```
+
+Rules:
+
+- `issueDependencies: "auto"` means try native dependencies and fall back to
+  frontmatter `depends_on` if the endpoint returns unsupported/not found/gone.
+- `issueTypes` maps backlog types to existing GitHub issue type names. If the
+  type update fails because the type is unavailable, fall back to
+  `backlog/type:*` labels.
+- `issueFields` is optional and field-ID based. `customFields` may be accepted
+  as a migration alias, but `issueFields` is the canonical name. When configured
+  and accepted by GitHub, issue fields mirror priority/status/workstream/due_date
+  into native fields. Labels remain the baseline canonical fallback for priority
+  and status, and frontmatter remains the baseline canonical fallback for
+  workstream and due_date.
+- Issue fields are issue-only. Pull requests do not support issue fields.
+- GitHub users can set, edit, and clear issue field values through the issue
+  sidebar, GitHub Projects, the API, or GitHub Actions. Issue field values are
+  not set through URL query parameters or issue templates.
+- The adapter mirrors only `text`, `single_select`, `number`, and `date`
+  issue fields. Organization issue field definitions also support
+  `multi_select`, but this backend should leave multi-select and unrelated
+  fields untouched.
+- `optionMap` maps backlog enum values to GitHub single-select option names.
+- Per-issue `GET /repos/{owner}/{repo}/issues/{issue_number}/issue-field-values`
+  lists the issue's field values.
+- Per-issue `POST /repos/{owner}/{repo}/issues/{issue_number}/issue-field-values`
+  adds or updates the provided field values without replacing unrelated existing
+  issue field values. The request body shape is:
+  `{ "issue_field_values": [{ "field_id": 123, "value": "Critical" }] }`.
+- Per-issue `PUT /repos/{owner}/{repo}/issues/{issue_number}/issue-field-values`
+  sets/replaces the issue's field values with the provided set. Avoid PUT when
+  mirroring backlog metadata because it can clobber unrelated human-managed
+  fields.
+- `DELETE /repos/{owner}/{repo}/issues/{issue_number}/issue-field-values/{issue_field_id}`
+  clears a single issue field value.
+- Issue fields are searchable with `field.<name>:<value>` query syntax, but the
+  backend still applies the same final client-side reconciliation used by reads.
+- Issue field changes trigger `issues` webhook activity types `field_added` and
+  `field_removed`. Webhook handling is out of scope for this backend, but these
+  event names should be used by future sync integrations.
+- Native capability failures should be cached per backend/repo for the current
+  process so one unsupported repo does not repeatedly hit failing endpoints.
+
+This tiered model lets GourmetPro org repos use native GitHub fields and
+relationships where available while preserving the "works with ordinary issues"
+backend behavior.
 
 ### Repository Discovery
 
@@ -293,8 +426,8 @@ This is valid enough frontmatter for humans to recognize while avoiding a YAML
 runtime dependency and avoiding lossy ad hoc parsing. Unknown keys are preserved
 when rewriting frontmatter.
 
-Frontmatter is canonical for fields that do not have a GitHub-native or label
-representation:
+Frontmatter is the baseline representation for fields that do not have an
+available GitHub-native or label representation:
 
 - `workstream`
 - `depends_on`
@@ -308,6 +441,12 @@ representation:
 
 Frontmatter mirrors status, priority, and type for readability, but labels and
 issue state are canonical for those enum fields.
+
+When native dependencies are available, `depends_on` is mirrored from GitHub's
+`blocked_by` relationship and frontmatter is fallback only. When native issue
+fields are configured, workstream/priority/status/due_date are mirrored into
+those fields, but the read mapper still tolerates missing or unsupported issue
+fields.
 
 ### Labels And State
 
@@ -354,12 +493,31 @@ Status reconciliation on read:
 - open issue + valid status label means that label's status
 - open issue + missing status label means `queued`
 
-Priority and type reconciliation on read:
+Priority reconciliation on read:
 
-- valid priority/type labels win
+- valid priority labels win
+- configured native issue fields may be used before frontmatter when present
 - frontmatter is fallback
 - missing priority defaults to `p2`
+
+Type reconciliation on read:
+
+- configured native issue `type` wins when `features.issueTypes` maps the GitHub
+  type name to a backlog type
+- valid `backlog/type:*` labels are fallback
+- frontmatter is final fallback
 - missing type defaults to `engineering`
+
+Issue field reconciliation on read:
+
+- Fetch
+  `GET /repos/{owner}/{repo}/issues/{issue_number}/issue-field-values` with
+  `X-GitHub-Api-Version: 2026-03-10` only when `features.issueFields` is
+  configured.
+- Use only configured field IDs and only supported mirror data types
+  `text`, `single_select`, `number`, and `date`.
+- Leave unrelated issue fields untouched and ignore missing, unsupported, or
+  unconfigured values.
 
 The read path must tolerate human-edited GitHub issues that violate CLI write
 rules. Validation remains strict for CLI writes.
@@ -414,6 +572,11 @@ backlog/type:spec_pending_impl    color 5319e7  description "Backlog type: spec 
 backlog/type:wiki_ops             color 006b75  description "Backlog type: wiki ops"
 ```
 
+If native issue dependencies, issue types, or configured issue fields are
+available, `create-repo` may also run a non-mutating capability probe and include
+capability details in the returned row under `github_capabilities`. It must not
+fail solely because optional native capabilities are unavailable.
+
 #### `list-items`
 
 Lists issues labeled `backlog`.
@@ -449,6 +612,9 @@ Filtering:
   cannot exclude frontmatter fallback values. Final filtering uses reconciled row
   fields.
 - `--workstream` parses frontmatter and filters client-side.
+- Configured issue fields may use GitHub's `field.<name>:<value>` search syntax
+  as an optimization only when that cannot exclude frontmatter or label fallback
+  values. Final filtering still uses reconciled row fields.
 - `--q` uses GitHub issue search and then maps results back to backlog rows.
 - `--limit` and `--offset` apply to the merged client-side result set.
 
@@ -465,8 +631,16 @@ If the issue does not have the `backlog` label, fail clearly instead of mapping
 an arbitrary GitHub issue as a backlog item.
 
 The `blocks` field is supported by searching or scanning for issues whose
-frontmatter `depends_on` contains the requested ID. This can be eventually
-consistent and capped.
+frontmatter `depends_on` contains the requested ID. When native issue
+dependencies are available, use:
+
+```text
+GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocking
+```
+
+and map the returned issues to `blocks`. The native path is preferred because it
+is not full-text search and is less likely to be stale. The frontmatter
+search/scan path remains the fallback.
 
 #### `summarize`
 
@@ -505,6 +679,9 @@ Fetches the issue, maps current state, applies CLI validation, then patches:
 - title when `--title` is passed
 - body/frontmatter when body or metadata fields change
 - labels when status/priority/type changes
+- native issue type when configured and accepted
+- native issue fields when configured and accepted
+- native issue dependencies when available and `--depends-on` changes
 - issue state when status enters or leaves `done`/`abandoned`
 
 On GitHub, `--body` replaces only the human-readable content below the closing
@@ -519,6 +696,12 @@ Changing status to `done` closes the issue with `state_reason: completed` where
 the API accepts it. Changing status to `abandoned` closes the issue with
 `state_reason: not_planned`. Moving from `done` or `abandoned` to an open status
 reopens the issue.
+
+For `--depends-on`, the GitHub adapter resolves dependency backlog IDs to GitHub
+issues. If native dependencies are available and the dependency is in a
+compatible repository scope, it updates `/dependencies/blocked_by`. If native
+dependencies are unavailable or reject the relationship, it updates frontmatter
+`depends_on` instead and reports a normal row response.
 
 ## Output Shape
 
@@ -571,7 +754,8 @@ console audit views unless a future sync/indexing layer is added.
 
 GitHub Search API is eventually consistent, separately rate-limited, and has
 result caps. This affects cross-repo `list-items`, `list-items --q`, broad
-`summarize`, and dependency `blocks` lookup.
+`summarize`, and fallback dependency `blocks` lookup. Native dependency endpoints
+avoid this limitation when available.
 
 Broad `summarize` and broad `list-items` can be expensive because they may scan
 many token-visible repositories.
@@ -622,6 +806,11 @@ Focused tests should cover:
 - Label/state reconciliation, including human-edited drift.
 - Filter behavior matching reconciliation for status, priority, type, and
   workstream.
+- Capability detection and fallback for native issue dependencies, issue types,
+  and configured issue fields. Issue field tests should exercise
+  `GET /orgs/{org}/issue-fields` and
+  `POST /repos/{owner}/{repo}/issues/{issue_number}/issue-field-values` with
+  `X-GitHub-Api-Version: 2026-03-10`.
 - GitHub command mapping with a fake HTTP server or injectable API client.
 - `create-repo` label bootstrapping behavior.
 - `create-item --id` rejection on GitHub.
@@ -642,7 +831,20 @@ GitHub REST API endpoints used by this design:
 - `POST /repos/{owner}/{repo}/issues`
 - `PATCH /repos/{owner}/{repo}/issues/{issue_number}`
 - `GET /search/issues`
+- `GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by`
+- `POST /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by`
+- `DELETE /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by/{issue_id}`
+- `GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocking`
+- organization issue field endpoints under `/orgs/{org}/issue-fields`
+- `GET /repos/{owner}/{repo}/issues/{issue_number}/issue-field-values`
+- `POST /repos/{owner}/{repo}/issues/{issue_number}/issue-field-values`
+- `DELETE /repos/{owner}/{repo}/issues/{issue_number}/issue-field-values/{issue_field_id}`
 - repository label endpoints under `/repos/{owner}/{repo}/labels`
+
+Issue field endpoints use `X-GitHub-Api-Version: 2026-03-10`. The backend should
+avoid `PUT /repos/{owner}/{repo}/issues/{issue_number}/issue-field-values` for
+metadata mirroring because it replaces the issue's field value set and can
+clobber unrelated human-managed fields.
 
 Implementation should rely on current GitHub REST documentation when coding
 request details, headers, permissions, and pagination.

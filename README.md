@@ -6,7 +6,7 @@ Portable command-line tools and Homebrew formulae for humans and agents.
 
 - `wt`: launch a Claude session in an isolated Git worktree.
 - `envrun`: run a command with local `.env` / `.env.local` files exported.
-- `backlog`: query and mutate the GourmetPro backlog database from a terminal.
+- `backlog`: query and mutate the GourmetPro backlog from Postgres or GitHub Issues.
 
 ## Install With Homebrew
 
@@ -26,22 +26,33 @@ The formulae live in:
 - `Formula/envrun.rb`
 - `Formula/backlog.rb`
 
-`backlog` uses `~/.config/ai-tools/backlog.conf` by default after Homebrew
+`backlog` uses `~/.config/ai-tools/backlog.json` by default after Homebrew
 installation. Create or edit it with:
 
 ```sh
 mkdir -p ~/.config/ai-tools
-$EDITOR ~/.config/ai-tools/backlog.conf
+$EDITOR ~/.config/ai-tools/backlog.json
 ```
 
-The file should contain:
+The file can contain one or more named backends:
 
-```sh
-DATABASE_URL='postgres://user:pass@host/db'
+```json
+{
+  "default": "gtm-console",
+  "backends": [
+    { "name": "gtm-console", "type": "postgres", "databaseUrlEnv": "BACKLOG_DATABASE_URL" },
+    { "name": "github", "type": "github-issues", "tokenEnv": "GITHUB_TOKEN" }
+  ]
+}
 ```
 
-You can override the config path with `BACKLOG_CONFIG`, or use
-`BACKLOG_DATABASE_URL` for one-off sessions.
+Choose a backend for one command with `backlog --backend github ...`, or set
+`BACKLOG_BACKEND` for automation. Old `~/.config/ai-tools/backlog.conf` files
+and `BACKLOG_DATABASE_URL` remain supported for Postgres compatibility.
+
+The GitHub backend stores backlog metadata in issue labels, issue body
+frontmatter, native issue dependencies, issue types, and configured issue fields
+when available. Configure `GITHUB_TOKEN` with repository issue write access.
 
 ## Install Without Homebrew
 
@@ -66,19 +77,20 @@ envrun --production -- node scripts/smoke-check.js
 envrun -- node scripts/example.js
 ```
 
-`install/backlog` prompts for `DATABASE_URL` when it creates a new config. Press
-Enter to skip; it will still create a template with `DATABASE_URL=` and the
-example `postgres://user:pass@host/db` as a comment. You can also pass the value
-directly:
+`install/backlog` prompts for `DATABASE_URL` when it creates a new JSON config.
+Press Enter to skip; it will still create a template that reads
+`BACKLOG_DATABASE_URL` and `GITHUB_TOKEN` from the environment. You can also pass
+the Postgres value directly:
 
 ```sh
 ./install/backlog --database-url 'postgres://user:pass@host/db'
 ```
 
 `backlog` writes its config to `$BACKLOG_CONFIG`,
-`$XDG_CONFIG_HOME/ai-tools/backlog.conf`, or
-`~/.config/ai-tools/backlog.conf`. Edit that file later to change the database
-URL.
+`$XDG_CONFIG_HOME/ai-tools/backlog.json`, or
+`~/.config/ai-tools/backlog.json`. Edit that file later to change backend
+selection or credentials. Existing `.conf` files are left in place and remain
+readable by the CLI when no JSON config is present.
 
 ## Development
 
