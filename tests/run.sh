@@ -4,6 +4,7 @@ set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FAILED=0
 CURRENT_TEST_FAILED=0
+FAKE_GITHUB_PID=""
 
 fail() {
   printf 'not ok - %s\n' "$CURRENT_TEST"
@@ -316,6 +317,595 @@ test_backlog_explains_missing_config() {
   assert_contains "$tmp/missing.conf" "$tmp/err" "missing config path" || return 1
 }
 
+test_backlog_json_config_selects_postgres_backend() {
+  local tmp="$1"
+  mkdir -p "$tmp/bin" "$tmp/config"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'set -euo pipefail' \
+    'printf "%s\n" "$@" > "$PSQL_ARGS_FILE"' \
+    'printf "[]\n"' > "$tmp/bin/psql"
+  chmod +x "$tmp/bin/psql"
+
+  cat > "$tmp/config/backlog.json" <<'JSON'
+{
+  "default": "pg",
+  "backends": [
+    { "name": "pg", "type": "postgres", "databaseUrl": "postgres://json.example/backlog" }
+  ]
+}
+JSON
+
+  PATH="$tmp/bin:$PATH" PSQL_ARGS_FILE="$tmp/psql.args" BACKLOG_CONFIG="$tmp/config/backlog.json" \
+    "$ROOT/tools/backlog" list-repos > "$tmp/out" 2> "$tmp/err" || {
+      fail "backlog should use postgres backend from JSON config; stderr was: $(<"$tmp/err")"
+      return 1
+    }
+
+  assert_eq 'postgres://json.example/backlog' "$(head -n 1 "$tmp/psql.args")" "JSON postgres database URL selected" || return 1
+  assert_eq '[]' "$(<"$tmp/out")" "JSON postgres output"
+}
+
+test_backlog_backend_flag_overrides_default_backend() {
+  local tmp="$1"
+  mkdir -p "$tmp/bin" "$tmp/config"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'set -euo pipefail' \
+    'printf "%s\n" "$@" > "$PSQL_ARGS_FILE"' \
+    'printf "[]\n"' > "$tmp/bin/psql"
+  chmod +x "$tmp/bin/psql"
+
+  cat > "$tmp/config/backlog.json" <<'JSON'
+{
+  "default": "default-pg",
+  "backends": [
+    { "name": "default-pg", "type": "postgres", "databaseUrl": "postgres://default.example/backlog" },
+    { "name": "override-pg", "type": "postgres", "databaseUrl": "postgres://override.example/backlog" }
+  ]
+}
+JSON
+
+  PATH="$tmp/bin:$PATH" PSQL_ARGS_FILE="$tmp/psql.args" BACKLOG_CONFIG="$tmp/config/backlog.json" \
+    "$ROOT/tools/backlog" --backend override-pg list-repos > "$tmp/out" 2> "$tmp/err" || {
+      fail "backlog --backend should override default; stderr was: $(<"$tmp/err")"
+      return 1
+    }
+
+  assert_eq 'postgres://override.example/backlog' "$(head -n 1 "$tmp/psql.args")" "backend flag database URL selected"
+}
+
+test_backlog_backend_flag_can_appear_after_command() {
+  local tmp="$1"
+  mkdir -p "$tmp/bin" "$tmp/config"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'set -euo pipefail' \
+    'printf "%s\n" "$@" > "$PSQL_ARGS_FILE"' \
+    'printf "[]\n"' > "$tmp/bin/psql"
+  chmod +x "$tmp/bin/psql"
+
+  cat > "$tmp/config/backlog.json" <<'JSON'
+{
+  "default": "default-pg",
+  "backends": [
+    { "name": "default-pg", "type": "postgres", "databaseUrl": "postgres://default.example/backlog" },
+    { "name": "after-command-pg", "type": "postgres", "databaseUrl": "postgres://after.example/backlog" }
+  ]
+}
+JSON
+
+  PATH="$tmp/bin:$PATH" PSQL_ARGS_FILE="$tmp/psql.args" BACKLOG_CONFIG="$tmp/config/backlog.json" \
+    "$ROOT/tools/backlog" list-repos --backend after-command-pg > "$tmp/out" 2> "$tmp/err" || {
+      fail "backlog should accept --backend after the command; stderr was: $(<"$tmp/err")"
+      return 1
+    }
+
+  assert_eq 'postgres://after.example/backlog' "$(head -n 1 "$tmp/psql.args")" "after-command backend flag selected"
+}
+
+test_backlog_database_url_env_overrides_postgres_backend_url() {
+  local tmp="$1"
+  mkdir -p "$tmp/bin" "$tmp/config"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'set -euo pipefail' \
+    'printf "%s\n" "$@" > "$PSQL_ARGS_FILE"' \
+    'printf "[]\n"' > "$tmp/bin/psql"
+  chmod +x "$tmp/bin/psql"
+
+  cat > "$tmp/config/backlog.json" <<'JSON'
+{ "default": "pg", "backends": [{ "name": "pg", "type": "postgres", "databaseUrl": "postgres://file.example/backlog" }] }
+JSON
+
+  PATH="$tmp/bin:$PATH" PSQL_ARGS_FILE="$tmp/psql.args" BACKLOG_CONFIG="$tmp/config/backlog.json" BACKLOG_DATABASE_URL="postgres://env.example/backlog" \
+    "$ROOT/tools/backlog" list-repos > "$tmp/out" 2> "$tmp/err" || {
+      fail "BACKLOG_DATABASE_URL should override postgres backend URL; stderr was: $(<"$tmp/err")"
+      return 1
+    }
+
+  assert_eq 'postgres://env.example/backlog' "$(head -n 1 "$tmp/psql.args")" "DATABASE_URL env override"
+}
+
+start_fake_github() {
+  local tmp="$1"
+  local script="$tmp/fake-github.js"
+  cat > "$script" <<'JS'
+const http = require('http');
+const repo = {
+  full_name: 'GourmetPro/gtm-claude-code',
+  name: 'gtm-claude-code',
+  default_branch: 'main',
+  html_url: 'https://github.com/GourmetPro/gtm-claude-code',
+  created_at: '2026-01-01T00:00:00Z'
+};
+const labels = new Set();
+const issues = new Map();
+const blockedBy = new Map();
+const fieldLog = [];
+const headerLog = [];
+let nextNumber = 1;
+const now = '2026-01-02T00:00:00Z';
+
+function send(res, status, value) {
+  res.statusCode = status;
+  res.setHeader('content-type', 'application/json');
+  res.end(JSON.stringify(value));
+}
+function repoPath(pathname) {
+  const m = pathname.match(/^\/repos\/([^/]+)\/([^/]+)(.*)$/);
+  if (!m) return null;
+  return { owner: m[1], repo: m[2], rest: m[3] || '' };
+}
+function issueJson(number) {
+  return issues.get(Number(number));
+}
+function allIssues() {
+  return [...issues.values()];
+}
+function mutateIssue(issue, patch) {
+  if (patch.title !== undefined) issue.title = patch.title;
+  if (patch.body !== undefined) issue.body = patch.body;
+  if (patch.labels !== undefined) issue.labels = patch.labels.map((name) => ({ name }));
+  if (patch.state !== undefined) {
+    issue.state = patch.state;
+    issue.closed_at = patch.state === 'closed' ? now : null;
+  }
+  if (patch.type !== undefined) issue.type = { name: patch.type };
+  issue.updated_at = now;
+  return issue;
+}
+
+const server = http.createServer((req, res) => {
+  const url = new URL(req.url, 'http://127.0.0.1');
+  let body = '';
+  req.on('data', (chunk) => { body += chunk; });
+  req.on('end', () => {
+    const parsed = body ? JSON.parse(body) : {};
+    if (url.pathname.includes('/issue-field-values') || url.pathname.match(/^\/orgs\/[^/]+\/issue-fields$/)) {
+      headerLog.push({ method: req.method, path: url.pathname, version: req.headers['x-github-api-version'] });
+    }
+    if (req.method === 'GET' && url.pathname === '/user/repos') return send(res, 200, [repo]);
+    if (req.method === 'GET' && url.pathname === '/installation/repositories') return send(res, 200, { repositories: [repo] });
+    if (req.method === 'GET' && url.pathname === '/search/issues') return send(res, 200, { items: allIssues() });
+    if (req.method === 'GET' && url.pathname === '/__test/field-log') return send(res, 200, fieldLog);
+    if (req.method === 'GET' && url.pathname === '/__test/headers') return send(res, 200, headerLog);
+    if (req.method === 'GET' && url.pathname === '/orgs/GourmetPro/issue-fields') {
+      return send(res, 200, [
+        { id: 101, name: 'Priority', data_type: 'single_select' },
+        { id: 102, name: 'Status', data_type: 'single_select' },
+        { id: 103, name: 'Workstream', data_type: 'text' },
+        { id: 104, name: 'Due Date', data_type: 'date' }
+      ]);
+    }
+    if (req.method === 'PATCH' && url.pathname.startsWith('/__test/issues/')) {
+      const number = Number(url.pathname.split('/').pop());
+      const issue = issueJson(number);
+      if (!issue) return send(res, 404, { message: 'not found' });
+      if (parsed.labels) parsed.labels = parsed.labels.map((name) => ({ name }));
+      Object.assign(issue, parsed);
+      return send(res, 200, issue);
+    }
+
+    const rp = repoPath(url.pathname);
+    if (!rp) return send(res, 404, { message: `not found: ${req.method} ${url.pathname}` });
+    if (req.method === 'GET' && rp.rest === '') return send(res, 200, repo);
+    if (req.method === 'POST' && rp.rest === '/labels') {
+      labels.add(parsed.name);
+      return send(res, labels.has(parsed.name) ? 201 : 422, parsed);
+    }
+    if (req.method === 'GET' && rp.rest === '/issues') return send(res, 200, allIssues());
+    if (req.method === 'POST' && rp.rest === '/issues') {
+      const number = nextNumber++;
+      const issue = {
+        id: 1000 + number,
+        number,
+        title: parsed.title,
+        body: parsed.body || '',
+        labels: (parsed.labels || []).map((name) => ({ name })),
+        state: 'open',
+        type: parsed.type ? { name: parsed.type } : null,
+        field_values: [{ issue_field_id: 999, issue_field_name: 'Unrelated', data_type: 'text', value: 'keep' }],
+        html_url: `${repo.html_url}/issues/${number}`,
+        repository_url: 'https://api.github.test/repos/GourmetPro/gtm-claude-code',
+        repository: repo,
+        created_at: now,
+        updated_at: now,
+        closed_at: null
+      };
+      issues.set(number, issue);
+      return send(res, 201, issue);
+    }
+
+    const issueMatch = rp.rest.match(/^\/issues\/([0-9]+)(.*)$/);
+    if (!issueMatch) return send(res, 404, { message: `not found: ${req.method} ${url.pathname}` });
+    const number = Number(issueMatch[1]);
+    const suffix = issueMatch[2] || '';
+    const issue = issueJson(number);
+    if (!issue) return send(res, 404, { message: 'not found' });
+    if (req.method === 'GET' && suffix === '') return send(res, 200, issue);
+    if (req.method === 'PATCH' && suffix === '') return send(res, 200, mutateIssue(issue, parsed));
+    if (req.method === 'GET' && suffix === '/issue-field-values') return send(res, 200, issue.field_values);
+    if (req.method === 'POST' && suffix === '/issue-field-values') {
+      for (const value of parsed.issue_field_values || []) {
+        fieldLog.push({ issue: number, ...value });
+        const idx = issue.field_values.findIndex((v) => Number(v.issue_field_id) === Number(value.field_id));
+        const next = { issue_field_id: value.field_id, issue_field_name: `field-${value.field_id}`, data_type: 'text', value: value.value };
+        if (idx === -1) issue.field_values.push(next);
+        else issue.field_values[idx] = { ...issue.field_values[idx], ...next };
+      }
+      return send(res, 200, issue.field_values);
+    }
+    const delField = suffix.match(/^\/issue-field-values\/([0-9]+)$/);
+    if (req.method === 'DELETE' && delField) {
+      issue.field_values = issue.field_values.filter((v) => Number(v.issue_field_id) !== Number(delField[1]));
+      return send(res, 204, {});
+    }
+    if (req.method === 'GET' && suffix === '/dependencies/blocked_by') {
+      const ids = blockedBy.get(number) || new Set();
+      return send(res, 200, allIssues().filter((i) => ids.has(i.id)));
+    }
+    if (req.method === 'POST' && suffix === '/dependencies/blocked_by') {
+      if (!blockedBy.has(number)) blockedBy.set(number, new Set());
+      blockedBy.get(number).add(Number(parsed.issue_id));
+      return send(res, 201, {});
+    }
+    const delDep = suffix.match(/^\/dependencies\/blocked_by\/([0-9]+)$/);
+    if (req.method === 'DELETE' && delDep) {
+      if (blockedBy.has(number)) blockedBy.get(number).delete(Number(delDep[1]));
+      return send(res, 204, {});
+    }
+    if (req.method === 'GET' && suffix === '/dependencies/blocking') {
+      const targetId = issue.id;
+      const rows = allIssues().filter((candidate) => {
+        const ids = blockedBy.get(candidate.number);
+        return ids && ids.has(targetId);
+      });
+      return send(res, 200, rows);
+    }
+    return send(res, 404, { message: `not found: ${req.method} ${url.pathname}` });
+  });
+});
+server.listen(0, '127.0.0.1', () => {
+  console.log(server.address().port);
+});
+JS
+  node "$script" > "$tmp/fake-github.port" 2> "$tmp/fake-github.err" &
+  local pid=$!
+  for _ in {1..50}; do
+    [[ -s "$tmp/fake-github.port" ]] && break
+    sleep 0.1
+  done
+  FAKE_GITHUB_PID="$pid"
+}
+
+write_github_config() {
+  local tmp="$1"
+  local port="$2"
+  mkdir -p "$tmp/config"
+  cat > "$tmp/config/backlog.json" <<JSON
+{
+  "default": "gh",
+  "backends": [
+    {
+      "name": "gh",
+      "type": "github-issues",
+      "tokenEnv": "TEST_GITHUB_TOKEN",
+      "apiBaseUrl": "http://127.0.0.1:$port",
+      "features": {
+        "issueTypes": { "engineering": "Engineering" },
+        "issueFields": {
+          "priority": { "fieldId": 101, "dataType": "single_select", "optionMap": { "p0": "P0", "p1": "P1", "p2": "P2", "p3": "P3" } },
+          "status": { "fieldId": 102, "dataType": "single_select", "optionMap": { "queued": "Queued", "in_progress": "In progress", "blocked": "Blocked", "done": "Done", "abandoned": "Abandoned" } },
+          "workstream": { "fieldId": 103, "dataType": "text" },
+          "due_date": { "fieldId": 104, "dataType": "date" }
+        }
+      }
+    }
+  ]
+}
+JSON
+}
+
+test_backlog_github_create_repo_does_not_require_postgres_alias_flags() {
+  local tmp="$1"
+  mkdir -p "$tmp/config"
+  cat > "$tmp/config/backlog.json" <<JSON
+{
+  "default": "gh",
+  "backends": [
+    { "name": "gh", "type": "github-issues", "tokenEnv": "TEST_GITHUB_TOKEN", "apiBaseUrl": "http://127.0.0.1:9" }
+  ]
+}
+JSON
+
+  BACKLOG_CONFIG="$tmp/config/backlog.json" TEST_GITHUB_TOKEN=test \
+    "$ROOT/tools/backlog" create-repo --slug GourmetPro/gtm-claude-code > "$tmp/out" 2> "$tmp/err"
+  local status=$?
+
+  if [[ "$status" -eq 0 ]]; then
+    fail "github create-repo should not succeed against closed fake port"
+    return 1
+  fi
+  if grep -Fq -- "--short-slug is required" "$tmp/err" || grep -Fq -- "--display-name is required" "$tmp/err"; then
+    fail "github create-repo must not require Postgres alias flags; stderr was: $(<"$tmp/err")"
+    return 1
+  fi
+}
+
+test_backlog_github_id_and_frontmatter_helpers() {
+  local tmp="$1"
+
+  BACKLOG_TEST_HELPERS=1 "$ROOT/tools/backlog" __test-github-id \
+    --repo "GourmetPro/repo.with_under--dash" \
+    --number 123 > "$tmp/id.out" 2> "$tmp/id.err" || {
+      fail "github id helper should succeed; stderr was: $(<"$tmp/id.err")"
+      return 1
+    }
+  assert_eq 'gourmetpro--repo.with_under--dash--123' "$(<"$tmp/id.out")" "lossless github id" || return 1
+
+  cat > "$tmp/body.md" <<'EOF'
+---
+workstream: "old"
+links: []
+unknown_key: "preserve me"
+---
+
+Human body.
+
+---
+
+Not frontmatter.
+EOF
+
+  BACKLOG_TEST_HELPERS=1 "$ROOT/tools/backlog" __test-frontmatter-roundtrip \
+    --file "$tmp/body.md" \
+    --set '{"workstream":"new","links":[{"kind":"url","url":"https://example.com"}]}' \
+    > "$tmp/front.out" 2> "$tmp/front.err" || {
+      fail "frontmatter helper should succeed; stderr was: $(<"$tmp/front.err")"
+      return 1
+    }
+
+  assert_contains 'workstream: "new"' "$tmp/front.out" "frontmatter updates workstream" || return 1
+  assert_contains 'unknown_key: "preserve me"' "$tmp/front.out" "frontmatter preserves unknown keys" || return 1
+  assert_contains 'Not frontmatter.' "$tmp/front.out" "human body preserved" || return 1
+
+  printf '%s' "$(<"$tmp/front.out")" > "$tmp/front-once.md"
+  BACKLOG_TEST_HELPERS=1 "$ROOT/tools/backlog" __test-frontmatter-roundtrip \
+    --file "$tmp/front-once.md" \
+    --set '{"workstream":"new","links":[{"kind":"url","url":"https://example.com"}]}' \
+    > "$tmp/front-twice.out" 2> "$tmp/front-twice.err" || {
+      fail "second frontmatter roundtrip should succeed; stderr was: $(<"$tmp/front-twice.err")"
+      return 1
+    }
+  assert_eq "$(<"$tmp/front.out")" "$(<"$tmp/front-twice.out")" "frontmatter roundtrip is byte-stable"
+}
+
+test_backlog_github_repository_commands() {
+  local tmp="$1"
+  local pid port
+  start_fake_github "$tmp"
+  pid="$FAKE_GITHUB_PID"
+  port="$(cat "$tmp/fake-github.port")"
+  write_github_config "$tmp" "$port"
+
+  BACKLOG_CONFIG="$tmp/config/backlog.json" TEST_GITHUB_TOKEN=test \
+    "$ROOT/tools/backlog" list-repos > "$tmp/list.out" 2> "$tmp/list.err" || {
+      fail "github list-repos should succeed; stderr was: $(<"$tmp/list.err")"
+      return 1
+    }
+  assert_contains '"slug": "GourmetPro/gtm-claude-code"' "$tmp/list.out" "github repo slug" || return 1
+  assert_contains '"short_slug": "gourmetpro--gtm-claude-code"' "$tmp/list.out" "github repo short slug" || return 1
+
+  BACKLOG_CONFIG="$tmp/config/backlog.json" TEST_GITHUB_TOKEN=test \
+    "$ROOT/tools/backlog" create-repo --slug GourmetPro/gtm-claude-code > "$tmp/create.out" 2> "$tmp/create.err" || {
+      fail "github create-repo should succeed; stderr was: $(<"$tmp/create.err")"
+      return 1
+    }
+  assert_contains '"slug": "GourmetPro/gtm-claude-code"' "$tmp/create.out" "github create-repo slug" || return 1
+  curl -sS "http://127.0.0.1:$port/__test/headers" > "$tmp/headers.out"
+  assert_contains '"path":"/orgs/GourmetPro/issue-fields"' "$tmp/headers.out" "github probes organization issue fields" || return 1
+  assert_contains '"version":"2026-03-10"' "$tmp/headers.out" "github issue field probe uses current API version" || return 1
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
+test_backlog_github_create_get_update_item_and_fields() {
+  local tmp="$1"
+  local pid port
+  start_fake_github "$tmp"
+  pid="$FAKE_GITHUB_PID"
+  port="$(cat "$tmp/fake-github.port")"
+  write_github_config "$tmp" "$port"
+
+  BACKLOG_CONFIG="$tmp/config/backlog.json" TEST_GITHUB_TOKEN=test \
+    "$ROOT/tools/backlog" create-item --repo GourmetPro/gtm-claude-code --workstream tooling --title "GitHub backend" --type engineering --priority p1 --body "Human body" \
+    > "$tmp/create.out" 2> "$tmp/create.err" || {
+      fail "github create-item should succeed; stderr was: $(<"$tmp/create.err")"
+      return 1
+    }
+
+  assert_contains '"id": "gourmetpro--gtm-claude-code--1"' "$tmp/create.out" "github create id" || return 1
+  assert_contains '"console_url": "https://github.com/GourmetPro/gtm-claude-code/issues/1"' "$tmp/create.out" "github console_url" || return 1
+  curl -sS "http://127.0.0.1:$port/__test/field-log" > "$tmp/fields.out"
+  assert_contains '"field_id":101' "$tmp/fields.out" "github priority issue field mirrored" || return 1
+  assert_contains '"field_id":103' "$tmp/fields.out" "github workstream issue field mirrored" || return 1
+  curl -sS "http://127.0.0.1:$port/__test/headers" > "$tmp/headers.out"
+  assert_contains '"path":"/repos/GourmetPro/gtm-claude-code/issues/1/issue-field-values"' "$tmp/headers.out" "github posts issue field values" || return 1
+  assert_contains '"version":"2026-03-10"' "$tmp/headers.out" "github issue field values use current API version" || return 1
+
+  BACKLOG_CONFIG="$tmp/config/backlog.json" TEST_GITHUB_TOKEN=test \
+    "$ROOT/tools/backlog" get-item --id gourmetpro--gtm-claude-code--1 > "$tmp/get.out" 2> "$tmp/get.err" || {
+      fail "github get-item should succeed; stderr was: $(<"$tmp/get.err")"
+      return 1
+    }
+  assert_contains '"workstream": "tooling"' "$tmp/get.out" "github get workstream" || return 1
+
+  BACKLOG_CONFIG="$tmp/config/backlog.json" TEST_GITHUB_TOKEN=test \
+    "$ROOT/tools/backlog" update-item --id gourmetpro--gtm-claude-code--1 --status done --progress-note "Shipped" \
+    > "$tmp/update.out" 2> "$tmp/update.err" || {
+      fail "github update-item should succeed; stderr was: $(<"$tmp/update.err")"
+      return 1
+    }
+  assert_contains '"status": "done"' "$tmp/update.out" "github update status" || return 1
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
+test_backlog_github_rejects_explicit_create_id() {
+  local tmp="$1"
+  local pid port
+  start_fake_github "$tmp"
+  pid="$FAKE_GITHUB_PID"
+  port="$(cat "$tmp/fake-github.port")"
+  write_github_config "$tmp" "$port"
+
+  if BACKLOG_CONFIG="$tmp/config/backlog.json" TEST_GITHUB_TOKEN=test \
+    "$ROOT/tools/backlog" create-item --repo GourmetPro/gtm-claude-code --workstream tooling --title "Bad ID" --type engineering --id explicit--id > "$tmp/out" 2> "$tmp/err"; then
+    fail "github create-item --id should fail"
+    return 1
+  fi
+  assert_contains "--id is not supported by github-issues backends" "$tmp/err" "github create id rejection" || return 1
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
+test_backlog_github_read_tolerates_human_edited_status_drift() {
+  local tmp="$1"
+  local pid port
+  start_fake_github "$tmp"
+  pid="$FAKE_GITHUB_PID"
+  port="$(cat "$tmp/fake-github.port")"
+  write_github_config "$tmp" "$port"
+
+  BACKLOG_CONFIG="$tmp/config/backlog.json" TEST_GITHUB_TOKEN=test \
+    "$ROOT/tools/backlog" create-item --repo GourmetPro/gtm-claude-code --workstream tooling --title "Drift" --type engineering > "$tmp/create.out" 2> "$tmp/create.err" || {
+      fail "github create drift fixture should succeed; stderr was: $(<"$tmp/create.err")"
+      return 1
+    }
+
+  curl -sS -X PATCH "http://127.0.0.1:$port/__test/issues/1" -d '{"state":"closed","labels":["backlog"]}' > /dev/null
+
+  BACKLOG_CONFIG="$tmp/config/backlog.json" TEST_GITHUB_TOKEN=test \
+    "$ROOT/tools/backlog" get-item --id gourmetpro--gtm-claude-code--1 > "$tmp/get.out" 2> "$tmp/get.err" || {
+      fail "github get drifted issue should succeed; stderr was: $(<"$tmp/get.err")"
+      return 1
+    }
+  assert_contains '"status": "done"' "$tmp/get.out" "closed issue without status label maps to done" || return 1
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
+test_backlog_github_ignores_pull_requests() {
+  local tmp="$1"
+  local pid port
+  start_fake_github "$tmp"
+  pid="$FAKE_GITHUB_PID"
+  port="$(cat "$tmp/fake-github.port")"
+  write_github_config "$tmp" "$port"
+
+  BACKLOG_CONFIG="$tmp/config/backlog.json" TEST_GITHUB_TOKEN=test \
+    "$ROOT/tools/backlog" create-item --repo GourmetPro/gtm-claude-code --workstream tooling --title "PR shaped" --type engineering > "$tmp/create.out" 2> "$tmp/create.err" || {
+      fail "github create PR fixture should succeed; stderr was: $(<"$tmp/create.err")"
+      return 1
+    }
+
+  curl -sS -X PATCH "http://127.0.0.1:$port/__test/issues/1" -d '{"pull_request":{"url":"https://api.github.test/repos/GourmetPro/gtm-claude-code/pulls/1"}}' > /dev/null
+
+  BACKLOG_CONFIG="$tmp/config/backlog.json" TEST_GITHUB_TOKEN=test \
+    "$ROOT/tools/backlog" list-items --repo GourmetPro/gtm-claude-code > "$tmp/list.out" 2> "$tmp/list.err" || {
+      fail "github list should ignore pull requests; stderr was: $(<"$tmp/list.err")"
+      return 1
+    }
+  assert_eq '[]' "$(<"$tmp/list.out")" "github list-items excludes pull requests" || return 1
+
+  if BACKLOG_CONFIG="$tmp/config/backlog.json" TEST_GITHUB_TOKEN=test \
+    "$ROOT/tools/backlog" get-item --id gourmetpro--gtm-claude-code--1 > "$tmp/get.out" 2> "$tmp/get.err"; then
+    fail "github get-item should reject pull requests"
+    return 1
+  fi
+  assert_contains "is a pull request" "$tmp/get.err" "github get-item pull request rejection" || return 1
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
+test_backlog_github_list_summarize_and_blocks() {
+  local tmp="$1"
+  local pid port
+  start_fake_github "$tmp"
+  pid="$FAKE_GITHUB_PID"
+  port="$(cat "$tmp/fake-github.port")"
+  write_github_config "$tmp" "$port"
+
+  BACKLOG_CONFIG="$tmp/config/backlog.json" TEST_GITHUB_TOKEN=test \
+    "$ROOT/tools/backlog" create-item --repo GourmetPro/gtm-claude-code --workstream tooling --title "GitHub parent" --type engineering > "$tmp/create1.out" 2> "$tmp/create1.err" || {
+      fail "github create parent should succeed; stderr was: $(<"$tmp/create1.err")"
+      return 1
+    }
+  BACKLOG_CONFIG="$tmp/config/backlog.json" TEST_GITHUB_TOKEN=test \
+    "$ROOT/tools/backlog" create-item --repo GourmetPro/gtm-claude-code --workstream tooling --title "GitHub child" --type engineering --depends-on gourmetpro--gtm-claude-code--1 > "$tmp/create2.out" 2> "$tmp/create2.err" || {
+      fail "github create child should succeed; stderr was: $(<"$tmp/create2.err")"
+      return 1
+    }
+  BACKLOG_CONFIG="$tmp/config/backlog.json" TEST_GITHUB_TOKEN=test \
+    "$ROOT/tools/backlog" create-item --repo GourmetPro/gtm-claude-code --workstream tooling --title "GitHub nonbacklog dependency" --type engineering --depends-on gourmetpro--gtm-claude-code--1 > "$tmp/create3.out" 2> "$tmp/create3.err" || {
+      fail "github create nonbacklog dependency fixture should succeed; stderr was: $(<"$tmp/create3.err")"
+      return 1
+    }
+  curl -sS -X PATCH "http://127.0.0.1:$port/__test/issues/3" -d '{"labels":[]}' > /dev/null
+
+  BACKLOG_CONFIG="$tmp/config/backlog.json" TEST_GITHUB_TOKEN=test \
+    "$ROOT/tools/backlog" list-items --repo GourmetPro/gtm-claude-code --status queued > "$tmp/list.out" 2> "$tmp/list.err" || {
+      fail "github list-items should succeed; stderr was: $(<"$tmp/list.err")"
+      return 1
+    }
+  assert_contains '"status": "queued"' "$tmp/list.out" "list-items status filter" || return 1
+
+  BACKLOG_CONFIG="$tmp/config/backlog.json" TEST_GITHUB_TOKEN=test \
+    "$ROOT/tools/backlog" list-items --q GitHub > "$tmp/search.out" 2> "$tmp/search.err" || {
+      fail "github search list-items should succeed; stderr was: $(<"$tmp/search.err")"
+      return 1
+    }
+  assert_contains '"title": "GitHub parent"' "$tmp/search.out" "search list-items returns parent" || return 1
+
+  BACKLOG_CONFIG="$tmp/config/backlog.json" TEST_GITHUB_TOKEN=test \
+    "$ROOT/tools/backlog" summarize --repo GourmetPro/gtm-claude-code > "$tmp/summary.out" 2> "$tmp/summary.err" || {
+      fail "github summarize should succeed; stderr was: $(<"$tmp/summary.err")"
+      return 1
+    }
+  assert_contains '"workstream": "tooling"' "$tmp/summary.out" "summarize workstream" || return 1
+
+  BACKLOG_CONFIG="$tmp/config/backlog.json" TEST_GITHUB_TOKEN=test \
+    "$ROOT/tools/backlog" get-item --id gourmetpro--gtm-claude-code--1 > "$tmp/get.out" 2> "$tmp/get.err" || {
+      fail "github get parent should succeed; stderr was: $(<"$tmp/get.err")"
+      return 1
+  }
+  assert_contains '"blocks": [' "$tmp/get.out" "get-item includes blocks" || return 1
+  assert_contains '"id": "gourmetpro--gtm-claude-code--2"' "$tmp/get.out" "get-item blocks include child" || return 1
+  if grep -Fq '"id": "gourmetpro--gtm-claude-code--3"' "$tmp/get.out"; then
+    fail "get-item blocks should skip non-backlog native dependencies"
+    return 1
+  fi
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
 test_backlog_documents_cli_for_agents() {
   local tmp="$1"
 
@@ -345,8 +935,8 @@ test_backlog_documents_cli_for_agents() {
   done
 
   assert_contains "Usage: backlog list-repos" "$tmp/list-repos.help.out" "list-repos help usage" || return 1
-  assert_contains "Shows repositories registered for backlog item ownership" "$tmp/list-repos.help.out" "list-repos help purpose" || return 1
-  assert_contains "Usage: backlog create-repo --slug <org/repo> --short-slug <short> --display-name <name>" "$tmp/create-repo.help.out" "create-repo help usage" || return 1
+  assert_contains "Shows repositories available to the selected backend" "$tmp/list-repos.help.out" "list-repos help purpose" || return 1
+  assert_contains "Usage: backlog create-repo --slug <org/repo>" "$tmp/create-repo.help.out" "create-repo help usage" || return 1
   assert_contains "--color <#RRGGBB>" "$tmp/create-repo.help.out" "create-repo help documents color" || return 1
   assert_contains "Usage: backlog list-items [--repo <org/repo>] [--workstream <name>]" "$tmp/list-items.help.out" "list-items help usage" || return 1
   assert_contains "--status <queued,in_progress,blocked,done,abandoned>" "$tmp/list-items.help.out" "list-items help documents statuses" || return 1
@@ -358,6 +948,8 @@ test_backlog_documents_cli_for_agents() {
   assert_contains "--source-context <text>" "$tmp/create-item.help.out" "create-item help documents source context" || return 1
   assert_contains "Usage: backlog update-item --id <item-id> [--status queued|in_progress|blocked|done|abandoned]" "$tmp/update-item.help.out" "update-item help usage" || return 1
   assert_contains "status=blocked requires --blocked-reason" "$tmp/update-item.help.out" "update-item help documents blocked reason" || return 1
+  assert_contains "BACKLOG_BACKEND" "$tmp/help.out" "help documents backend override" || return 1
+  assert_contains "github-issues" "$tmp/help.out" "help documents github backend" || return 1
 
   BACKLOG_CONFIG="$tmp/missing.conf" BACKLOG_DATABASE_URL= "$ROOT/tools/backlog" help update-item > "$tmp/help-command.out" 2> "$tmp/help-command.err" || {
     fail "backlog help update-item should succeed without database config; stderr was: $(<"$tmp/help-command.err")"
@@ -419,7 +1011,7 @@ test_backlog_installs_separately_and_writes_config() {
   local tmp="$1"
   "$ROOT/install/backlog" \
     --bin-dir "$tmp/bin" \
-    --config "$tmp/config/backlog.conf" \
+    --config "$tmp/config/backlog.json" \
     --database-url "postgres://install.example/backlog" > "$tmp/out" 2> "$tmp/err" || {
       fail "install/backlog should succeed; stderr was: $(<"$tmp/err")"
       return 1
@@ -429,14 +1021,16 @@ test_backlog_installs_separately_and_writes_config() {
     fail "install/backlog should create a backlog symlink"
     return 1
   }
-  assert_contains "DATABASE_URL='postgres://install.example/backlog'" "$tmp/config/backlog.conf" "installer database config" || return 1
+  assert_contains '"backends"' "$tmp/config/backlog.json" "installer writes backend array" || return 1
+  assert_contains '"databaseUrl": "postgres://install.example/backlog"' "$tmp/config/backlog.json" "installer database config" || return 1
+  assert_contains '"type": "github-issues"' "$tmp/config/backlog.json" "installer writes github backend template" || return 1
 }
 
 test_backlog_installer_creates_blank_config_template() {
   local tmp="$1"
   "$ROOT/install/backlog" \
     --bin-dir "$tmp/bin" \
-    --config "$tmp/config/backlog.conf" > "$tmp/out" 2> "$tmp/err" || {
+    --config "$tmp/config/backlog.json" > "$tmp/out" 2> "$tmp/err" || {
       fail "install/backlog should create a blank config without --database-url; stderr was: $(<"$tmp/err")"
       return 1
     }
@@ -445,8 +1039,24 @@ test_backlog_installer_creates_blank_config_template() {
     fail "install/backlog should create a backlog symlink"
     return 1
   }
-  assert_contains "# postgres://user:pass@host/db" "$tmp/config/backlog.conf" "blank config example comment" || return 1
-  assert_contains "DATABASE_URL=" "$tmp/config/backlog.conf" "blank config database key" || return 1
+  assert_contains '"databaseUrlEnv": "BACKLOG_DATABASE_URL"' "$tmp/config/backlog.json" "blank config database env key" || return 1
+  assert_contains '"tokenEnv": "GITHUB_TOKEN"' "$tmp/config/backlog.json" "blank config github token env" || return 1
+}
+
+test_backlog_installer_preserves_existing_legacy_conf() {
+  local tmp="$1"
+  mkdir -p "$tmp/config"
+  printf "DATABASE_URL='postgres://legacy.example/backlog'\n" > "$tmp/config/backlog.conf"
+
+  "$ROOT/install/backlog" \
+    --bin-dir "$tmp/bin" \
+    --config "$tmp/config/backlog.json" > "$tmp/out" 2> "$tmp/err" || {
+      fail "install/backlog should succeed when legacy conf exists; stderr was: $(<"$tmp/err")"
+      return 1
+    }
+
+  assert_contains "DATABASE_URL='postgres://legacy.example/backlog'" "$tmp/config/backlog.conf" "legacy conf preserved" || return 1
+  assert_contains '"backends"' "$tmp/config/backlog.json" "new JSON config created" || return 1
 }
 
 test_homebrew_wt_formula() {
@@ -478,6 +1088,7 @@ test_homebrew_backlog_formula() {
   assert_contains 'depends_on "libpq"' "$formula" "backlog formula psql dependency" || return 1
   assert_contains 'ENV["BACKLOG_DATABASE_URL"] = "postgres://example.invalid/backlog"' "$formula" "backlog formula test config override" || return 1
   assert_contains 'assert_match "Purpose:", shell_output("#{bin}/backlog --help")' "$formula" "backlog formula test uses help output" || return 1
+  assert_contains '~/.config/ai-tools/backlog.json' "$formula" "backlog formula caveats mention JSON config" || return 1
   ruby -c "$formula" > /dev/null || {
     fail "backlog formula should be valid Ruby"
     return 1
@@ -597,11 +1208,24 @@ run_test "envrun test flag loads .env.test" with_tmpdir test_envrun_test_flag_lo
 run_test "envrun production flag loads .env.production" with_tmpdir test_envrun_production_flag_loads_production_env
 run_test "backlog reads DATABASE_URL from editable config" with_tmpdir test_backlog_reads_database_url_from_config
 run_test "backlog explains missing config" with_tmpdir test_backlog_explains_missing_config
+run_test "backlog selects postgres backend from JSON config" with_tmpdir test_backlog_json_config_selects_postgres_backend
+run_test "backlog backend flag overrides default backend" with_tmpdir test_backlog_backend_flag_overrides_default_backend
+run_test "backlog backend flag can appear after command" with_tmpdir test_backlog_backend_flag_can_appear_after_command
+run_test "backlog database URL env overrides JSON postgres URL" with_tmpdir test_backlog_database_url_env_overrides_postgres_backend_url
+run_test "backlog github create-repo validation is adapter-owned" with_tmpdir test_backlog_github_create_repo_does_not_require_postgres_alias_flags
+run_test "backlog github id and frontmatter helpers" with_tmpdir test_backlog_github_id_and_frontmatter_helpers
+run_test "backlog github repository commands" with_tmpdir test_backlog_github_repository_commands
+run_test "backlog github create get update item and issue fields" with_tmpdir test_backlog_github_create_get_update_item_and_fields
+run_test "backlog github rejects explicit create id" with_tmpdir test_backlog_github_rejects_explicit_create_id
+run_test "backlog github read tolerates status drift" with_tmpdir test_backlog_github_read_tolerates_human_edited_status_drift
+run_test "backlog github ignores pull requests" with_tmpdir test_backlog_github_ignores_pull_requests
+run_test "backlog github list summarize and blocks" with_tmpdir test_backlog_github_list_summarize_and_blocks
 run_test "backlog documents CLI usage for agents" with_tmpdir test_backlog_documents_cli_for_agents
 run_test "wt has its own installer" with_tmpdir test_wt_installs_separately
 run_test "envrun has its own installer" with_tmpdir test_envrun_installs_separately
 run_test "backlog has its own installer and config setup" with_tmpdir test_backlog_installs_separately_and_writes_config
 run_test "backlog installer creates skippable blank config template" with_tmpdir test_backlog_installer_creates_blank_config_template
+run_test "backlog installer preserves existing legacy conf" with_tmpdir test_backlog_installer_preserves_existing_legacy_conf
 run_test "wt has a Homebrew formula" test_homebrew_wt_formula
 run_test "envrun has a Homebrew formula" test_homebrew_envrun_formula
 run_test "backlog has a Homebrew formula" test_homebrew_backlog_formula

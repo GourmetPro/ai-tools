@@ -7,10 +7,10 @@ Usage: install/backlog [--bin-dir DIR] [--config FILE] [--database-url URL] [--f
 
 Installs the backlog executable by symlinking tools/backlog into DIR.
 Default DIR: $AI_TOOLS_BIN_DIR, or ~/.local/bin.
-Default config: $BACKLOG_CONFIG, or $XDG_CONFIG_HOME/ai-tools/backlog.conf, or ~/.config/ai-tools/backlog.conf.
+Default config: $BACKLOG_CONFIG, or $XDG_CONFIG_HOME/ai-tools/backlog.json, or ~/.config/ai-tools/backlog.json.
 
 If the config file does not exist, the installer prompts for DATABASE_URL when
-interactive. Press Enter to skip and create an editable blank template.
+interactive. Press Enter to skip and create an editable backlog.json template.
 EOF
 }
 
@@ -21,6 +21,7 @@ die() {
 
 bin_dir="${AI_TOOLS_BIN_DIR:-}"
 config_path="${BACKLOG_CONFIG:-}"
+legacy_config_path=""
 database_url=""
 write_config=0
 force=0
@@ -77,11 +78,15 @@ fi
 
 if [ -z "$config_path" ]; then
   if [ -n "${XDG_CONFIG_HOME:-}" ]; then
-    config_path="$XDG_CONFIG_HOME/ai-tools/backlog.conf"
+    config_path="$XDG_CONFIG_HOME/ai-tools/backlog.json"
+    legacy_config_path="$XDG_CONFIG_HOME/ai-tools/backlog.conf"
   else
     [ -n "${HOME:-}" ] || die 'HOME is not set; pass --config'
-    config_path="$HOME/.config/ai-tools/backlog.conf"
+    config_path="$HOME/.config/ai-tools/backlog.json"
+    legacy_config_path="$HOME/.config/ai-tools/backlog.conf"
   fi
+else
+  legacy_config_path="$(dirname "$config_path")/backlog.conf"
 fi
 
 script_dir="$(CDPATH= cd "$(dirname "$0")" && pwd -P)"
@@ -102,9 +107,6 @@ if [ ! -f "$config_path" ] && [ "$write_config" -eq 0 ]; then
 fi
 
 if [ "$write_config" -eq 1 ]; then
-  case "$database_url" in
-    *"'"*) die "database URL contains a single quote; edit $config_path manually with double quotes" ;;
-  esac
   if [ -e "$config_path" ] && [ "$force" -ne 1 ]; then
     die "$config_path already exists; pass --force to replace it"
   fi
@@ -127,14 +129,27 @@ if [ "$write_config" -eq 1 ]; then
   umask 077
   tmp_config="$config_path.tmp.$$"
   {
-    printf '# Backlog CLI configuration\n'
-    printf "# Edit this file to change the database used by tools/backlog.\n"
-    printf "# postgres://user:pass@host/db\n"
+    printf '{\n'
+    printf '  "default": "gtm-console",\n'
+    printf '  "backends": [\n'
+    printf '    {\n'
+    printf '      "name": "gtm-console",\n'
+    printf '      "type": "postgres",\n'
     if [ -n "$database_url" ]; then
-      printf "DATABASE_URL='%s'\n" "$database_url"
+      node -e 'process.stdout.write(JSON.stringify(process.argv[1]))' "$database_url" > "$tmp_config.url"
+      printf '      "databaseUrl": %s\n' "$(cat "$tmp_config.url")"
+      rm -f "$tmp_config.url"
     else
-      printf "DATABASE_URL=\n"
+      printf '      "databaseUrlEnv": "BACKLOG_DATABASE_URL"\n'
     fi
+    printf '    },\n'
+    printf '    {\n'
+    printf '      "name": "github",\n'
+    printf '      "type": "github-issues",\n'
+    printf '      "tokenEnv": "GITHUB_TOKEN"\n'
+    printf '    }\n'
+    printf '  ]\n'
+    printf '}\n'
   } > "$tmp_config"
   mv "$tmp_config" "$config_path"
   chmod 600 "$config_path"
@@ -142,6 +157,9 @@ fi
 
 printf 'Installed backlog -> %s\n' "$target"
 printf 'Backlog config: %s\n' "$config_path"
+if [ -n "$legacy_config_path" ] && [ -f "$legacy_config_path" ]; then
+  printf 'Note: existing legacy config remains supported: %s\n' "$legacy_config_path" >&2
+fi
 
 case ":${PATH:-}:" in
   *":$bin_dir:"*) ;;

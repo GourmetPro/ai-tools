@@ -1,3 +1,6 @@
+# frozen_string_literal: true
+
+# Homebrew formula for the wt worktree launcher.
 class Wt < Formula
   desc "Launch Claude sessions in isolated Git worktrees"
   homepage "https://github.com/GourmetPro/ai-tools"
