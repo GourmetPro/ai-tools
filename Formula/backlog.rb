@@ -38,6 +38,8 @@ class Backlog < Formula
         }
 
       You can choose a backend with --backend or BACKLOG_BACKEND.
+      GitHub backends can use tokenEnv, or a literal token in a private
+      mode-0600 backlog.json.
       Existing ~/.config/ai-tools/backlog.conf files remain supported for
       Postgres compatibility when no backlog.json exists.
     EOS
