@@ -5,9 +5,9 @@ class Backlog < Formula
   desc "Database-backed backlog CLI"
   homepage "https://github.com/GourmetPro/ai-tools"
   url "https://github.com/GourmetPro/ai-tools.git",
-      tag:      "v0.3.1",
-      revision: "3a3e100d9cbbf0b72160fa9c3617df02e7e4f794"
-  version "0.3.1"
+      tag:      "v0.3.2",
+      revision: "fcda164021865771478e6daf1e30f855c8587a59"
+  version "0.3.2"
   depends_on "libpq"
   depends_on "node"
 
