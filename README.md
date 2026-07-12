@@ -54,8 +54,8 @@ The GitHub backend stores backlog metadata in native issue fields, issue types,
 open/closed state, and dependency relationships. It automatically reuses the
 organization's `Priority` and `Target date` fields and provisions the remaining
 backlog fields and types when the token has organization administration access.
-Issues use only the `backlog` label when native metadata is available. Related
-links render as normal Markdown; lossless fallback metadata lives in an
+Issues use the `backlog` label plus one or more `ws:<slug>` workstream labels.
+Related links render as normal Markdown; lossless fallback metadata lives in an
 invisible HTML comment instead of visible YAML frontmatter.
 
 Native schema setup requires organization `Issue Fields` and `Issue Types`
@@ -73,8 +73,9 @@ The default mapping is:
 - `due_date` → `Target date`
 - `status` → `Backlog status` (`Queued`, `In progress`, `Blocked`, `Done`, or
   `Abandoned`); the qualified name avoids GitHub's reserved `Status` field name
-- `workstream`, source/reason, branch, and progress values → matching
-  organization issue fields
+- `workstream` → one or more `ws:<slug>` labels; the GitHub backend accepts a
+  comma-separated set and returns both `workstream` and `workstreams`
+- source/reason, branch, and progress values → matching organization issue fields
 - backlog type → native `Engineering`, `Spec pending implementation`, or
   `Wiki ops` issue type
 - `depends_on` → native blocked-by relationships
@@ -83,6 +84,7 @@ These values are directly searchable in GitHub, for example:
 
 ```text
 label:backlog field.priority:high
+label:ws:about-page
 label:backlog field."backlog status":blocked
 label:backlog field."target date":<=2026-07-31
 ```
@@ -91,7 +93,25 @@ Existing `features.issueFields` and `features.issueTypes` mappings remain
 supported as explicit name/ID overrides. Set `features.issueFieldsMode` to
 `"off"` to disable issue-field discovery and use compatibility storage only.
 Legacy frontmatter remains readable and is migrated to the clean body format on
-the next `backlog update-item`.
+the next `backlog update-item`. A legacy `Workstream` field value is also read
+during migration, converted to a `ws:*` label, and cleared from that issue. The
+organization field itself is not deleted.
+
+GitHub create and update commands accept multiple memberships as a comma-separated
+`--workstream` value:
+
+```sh
+backlog create-item --repo GourmetPro/gourmetpro-website \
+  --workstream about-page,website-design \
+  --title "Refresh the broader team grid" \
+  --type engineering
+backlog update-item --id gourmetpro--gourmetpro-website--119 \
+  --workstream website-design,content-pipeline
+```
+
+`list-items --workstream website-design` matches any membership. `summarize`
+counts a multi-workstream issue once in each membership, so category totals may
+exceed the number of unique issues.
 
 ### Issue comments
 

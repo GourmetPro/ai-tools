@@ -828,7 +828,11 @@ test_backlog_github_repository_commands() {
   curl -sS "http://127.0.0.1:$port/__test/headers" > "$tmp/headers.out"
   assert_contains '"path":"/orgs/GourmetPro/issue-fields"' "$tmp/headers.out" "github probes organization issue fields" || return 1
   curl -sS "http://127.0.0.1:$port/__test/schema-log" > "$tmp/schema.out"
-  assert_contains '"name":"Workstream"' "$tmp/schema.out" "github provisions missing backlog issue fields" || return 1
+  if grep -Fq '"name":"Workstream"' "$tmp/schema.out"; then
+    fail "github must not provision the legacy Workstream field"
+    return 1
+  fi
+  assert_contains '"name":"Source context"' "$tmp/schema.out" "github provisions missing backlog issue fields" || return 1
   assert_contains '"name":"Backlog status"' "$tmp/schema.out" "github avoids GitHub reserved Status field name" || return 1
   assert_contains '"name":"Engineering"' "$tmp/schema.out" "github provisions missing backlog issue types" || return 1
   if grep -Fq '"name":"Priority"' "$tmp/schema.out" || grep -Fq '"name":"Target date"' "$tmp/schema.out"; then
@@ -880,8 +884,11 @@ test_backlog_github_create_get_update_item_and_fields() {
   port="$(cat "$tmp/fake-github.port")"
   write_github_config "$tmp" "$port"
 
+  curl -sS -X POST "http://127.0.0.1:$port/orgs/GourmetPro/issue-fields" \
+    -d '{"name":"Workstream","description":"Legacy backlog workstream","data_type":"text"}' > /dev/null
+
   BACKLOG_CONFIG="$tmp/config/backlog.json" TEST_GITHUB_TOKEN=test \
-    "$ROOT/tools/backlog" create-item --repo GourmetPro/gtm-claude-code --workstream tooling --title "GitHub backend" --type engineering --priority p1 --body "Human body" \
+    "$ROOT/tools/backlog" create-item --repo GourmetPro/gtm-claude-code --workstream tooling,docs --title "GitHub backend" --type engineering --priority p1 --body "Human body" \
       --source-context "Decision brief" --progress-note "Ready" --due-date 2026-07-18 \
       --links '[{"kind":"url","label":"Decision brief","url":"https://example.com/brief"}]' \
     > "$tmp/create.out" 2> "$tmp/create.err" || {
@@ -896,11 +903,14 @@ test_backlog_github_create_get_update_item_and_fields() {
   assert_contains '"field_id":104' "$tmp/fields.out" "github reuses native Target date field" || return 1
   assert_contains '"value":"High"' "$tmp/fields.out" "github maps p1 to native High priority" || return 1
   assert_contains '"value":"2026-07-18"' "$tmp/fields.out" "github mirrors due date" || return 1
-  assert_contains '"value":"tooling"' "$tmp/fields.out" "github mirrors workstream" || return 1
+  if grep -Fq '"field_id":105' "$tmp/fields.out"; then
+    fail "github must not write the legacy Workstream field"
+    return 1
+  fi
   assert_contains '"value":"Decision brief"' "$tmp/fields.out" "github mirrors source context" || return 1
   curl -sS "http://127.0.0.1:$port/__test/issues" > "$tmp/issues.out"
   assert_contains '"type":{"name":"Engineering"}' "$tmp/issues.out" "github uses native backlog issue type" || return 1
-  assert_contains '"labels":[{"name":"backlog"}]' "$tmp/issues.out" "github keeps only backlog label when native metadata works" || return 1
+  assert_contains '"labels":[{"name":"backlog"},{"name":"ws:docs"},{"name":"ws:tooling"}]' "$tmp/issues.out" "github stores multiple workstreams as labels" || return 1
   assert_contains '"body":"Human body\n\n<!-- backlog-metadata:v2 ' "$tmp/issues.out" "github writes clean human-first issue body" || return 1
   assert_contains '## Related context' "$tmp/issues.out" "github renders related context" || return 1
   if grep -Fq '"body":"---' "$tmp/issues.out"; then
@@ -916,7 +926,10 @@ test_backlog_github_create_get_update_item_and_fields() {
       fail "github get-item should succeed; stderr was: $(<"$tmp/get.err")"
       return 1
     }
-  assert_contains '"workstream": "tooling"' "$tmp/get.out" "github get workstream" || return 1
+  assert_contains '"workstream": "docs"' "$tmp/get.out" "github exposes deterministic singular workstream" || return 1
+  assert_contains '"workstreams": [' "$tmp/get.out" "github exposes complete workstream array" || return 1
+  assert_contains '"docs"' "$tmp/get.out" "github get includes docs workstream" || return 1
+  assert_contains '"tooling"' "$tmp/get.out" "github get includes tooling workstream" || return 1
 
   curl -sS "http://127.0.0.1:$port/__test/comments" > "$tmp/automatic-create-comments.out"
   assert_contains '### Progress update' "$tmp/automatic-create-comments.out" "create progress note posts native timeline comment" || return 1
@@ -948,7 +961,7 @@ test_backlog_github_create_get_update_item_and_fields() {
   assert_contains '### Blocked' "$tmp/automatic-comments.out" "blocked transition posts native timeline comment" || return 1
   assert_contains 'Waiting on API' "$tmp/automatic-comments.out" "blocker comment contains reason" || return 1
 
-  curl -sS -X PATCH "http://127.0.0.1:$port/__test/issues/1" -d '{"labels":["backlog","human-label"]}' > /dev/null
+  curl -sS -X PATCH "http://127.0.0.1:$port/__test/issues/1" -d '{"labels":["backlog","human-label","ws:docs","ws:research","ws:tooling"],"field_values":[{"issue_field_id":105,"issue_field_name":"Workstream","data_type":"text","value":"legacy-field"}]}' > /dev/null
 
   BACKLOG_CONFIG="$tmp/config/backlog.json" TEST_GITHUB_TOKEN=test \
     "$ROOT/tools/backlog" update-item --id gourmetpro--gtm-claude-code--1 --status done --progress-note "" \
@@ -961,11 +974,32 @@ test_backlog_github_create_get_update_item_and_fields() {
   curl -sS "http://127.0.0.1:$port/__test/field-log" > "$tmp/fields-updated.out"
   curl -sS "http://127.0.0.1:$port/__test/headers" > "$tmp/headers-updated.out"
   assert_contains '"name":"human-label"' "$tmp/issues-updated.out" "github update preserves human labels" || return 1
+  assert_contains '"name":"ws:docs"' "$tmp/issues-updated.out" "github update preserves first workstream label" || return 1
+  assert_contains '"name":"ws:research"' "$tmp/issues-updated.out" "github update preserves human-added workstream label" || return 1
+  assert_contains '"name":"ws:tooling"' "$tmp/issues-updated.out" "github update preserves second workstream label" || return 1
   if grep -Fq 'backlog/status:' "$tmp/issues-updated.out" || grep -Fq 'backlog/priority:' "$tmp/issues-updated.out" || grep -Fq 'backlog/type:' "$tmp/issues-updated.out"; then
     fail "github update must remove redundant managed metadata labels; fields were: $(<"$tmp/fields-updated.out"); headers were: $(<"$tmp/headers-updated.out"); issues were: $(<"$tmp/issues-updated.out")"
     return 1
   fi
   assert_contains '"deleted_field_id":' "$tmp/fields-updated.out" "github clears nullable managed field values" || return 1
+  assert_contains '"deleted_field_id":105' "$tmp/fields-updated.out" "github clears legacy Workstream field value" || return 1
+
+  BACKLOG_CONFIG="$tmp/config/backlog.json" TEST_GITHUB_TOKEN=test \
+    "$ROOT/tools/backlog" update-item --id gourmetpro--gtm-claude-code--1 --workstream product,tooling \
+    > "$tmp/workstreams.out" 2> "$tmp/workstreams.err" || {
+      fail "github workstream replacement should succeed; stderr was: $(<"$tmp/workstreams.err")"
+      return 1
+    }
+  assert_contains '"workstream": "product"' "$tmp/workstreams.out" "github workstream replacement updates singular compatibility value" || return 1
+  assert_contains '"workstreams": [' "$tmp/workstreams.out" "github workstream replacement returns array" || return 1
+  curl -sS "http://127.0.0.1:$port/__test/issues" > "$tmp/issues-workstreams.out"
+  assert_contains '"name":"human-label"' "$tmp/issues-workstreams.out" "github workstream replacement preserves human label" || return 1
+  assert_contains '"name":"ws:product"' "$tmp/issues-workstreams.out" "github workstream replacement adds product" || return 1
+  assert_contains '"name":"ws:tooling"' "$tmp/issues-workstreams.out" "github workstream replacement keeps tooling" || return 1
+  if grep -Fq '"name":"ws:docs"' "$tmp/issues-workstreams.out" || grep -Fq '"name":"ws:research"' "$tmp/issues-workstreams.out"; then
+    fail "github workstream replacement must remove obsolete ws labels"
+    return 1
+  fi
 
   BACKLOG_CONFIG="$tmp/config/backlog.json" TEST_GITHUB_TOKEN=test \
     "$ROOT/tools/backlog" update-item --id gourmetpro--gtm-claude-code--1 --status abandoned --abandoned-reason "No longer needed" \
@@ -1104,7 +1138,7 @@ test_backlog_github_native_metadata_fallback() {
   write_github_config "$tmp" "$port"
 
   BACKLOG_CONFIG="$tmp/config/backlog.json" TEST_GITHUB_TOKEN=test \
-    "$ROOT/tools/backlog" create-item --repo GourmetPro/gtm-claude-code --workstream fallback --title "Fallback metadata" --type wiki_ops --priority p0 --body "Readable body" \
+    "$ROOT/tools/backlog" create-item --repo GourmetPro/gtm-claude-code --workstream fallback,docs --title "Fallback metadata" --type wiki_ops --priority p0 --body "Readable body" \
     > "$tmp/create.out" 2> "$tmp/create.err" || {
       fail "github fallback create should succeed; stderr was: $(<"$tmp/create.err")"
       return 1
@@ -1112,6 +1146,8 @@ test_backlog_github_native_metadata_fallback() {
 
   curl -sS "http://127.0.0.1:$port/__test/issues" > "$tmp/issues.out"
   assert_contains '"name":"backlog/status:queued"' "$tmp/issues.out" "fallback keeps searchable status label" || return 1
+  assert_contains '"name":"ws:docs"' "$tmp/issues.out" "fallback keeps first workstream label" || return 1
+  assert_contains '"name":"ws:fallback"' "$tmp/issues.out" "fallback keeps second workstream label" || return 1
   assert_contains '"name":"backlog/priority:p0"' "$tmp/issues.out" "fallback keeps searchable priority label" || return 1
   assert_contains '<!-- backlog-metadata:v2 ' "$tmp/issues.out" "fallback keeps invisible lossless metadata" || return 1
   if grep -Fq '"body":"---' "$tmp/issues.out"; then
@@ -1124,7 +1160,8 @@ test_backlog_github_native_metadata_fallback() {
       fail "github fallback get should succeed; stderr was: $(<"$tmp/get.err")"
       return 1
     }
-  assert_contains '"workstream": "fallback"' "$tmp/get.out" "fallback metadata round trips" || return 1
+  assert_contains '"workstream": "docs"' "$tmp/get.out" "fallback singular workstream is deterministic" || return 1
+  assert_contains '"workstreams": [' "$tmp/get.out" "fallback metadata round trips multiple workstreams" || return 1
   assert_contains '"type": "wiki_ops"' "$tmp/get.out" "fallback type round trips" || return 1
 
   kill "$pid" 2>/dev/null || true
@@ -1199,7 +1236,7 @@ test_backlog_github_list_summarize_and_blocks() {
   write_github_config "$tmp" "$port"
 
   BACKLOG_CONFIG="$tmp/config/backlog.json" TEST_GITHUB_TOKEN=test \
-    "$ROOT/tools/backlog" create-item --repo GourmetPro/gtm-claude-code --workstream tooling --title "GitHub parent" --type engineering > "$tmp/create1.out" 2> "$tmp/create1.err" || {
+    "$ROOT/tools/backlog" create-item --repo GourmetPro/gtm-claude-code --workstream tooling,docs --title "GitHub parent" --type engineering > "$tmp/create1.out" 2> "$tmp/create1.err" || {
       fail "github create parent should succeed; stderr was: $(<"$tmp/create1.err")"
       return 1
     }
@@ -1223,6 +1260,17 @@ test_backlog_github_list_summarize_and_blocks() {
   assert_contains '"status": "queued"' "$tmp/list.out" "list-items status filter" || return 1
 
   BACKLOG_CONFIG="$tmp/config/backlog.json" TEST_GITHUB_TOKEN=test \
+    "$ROOT/tools/backlog" list-items --repo GourmetPro/gtm-claude-code --workstream docs > "$tmp/list-docs.out" 2> "$tmp/list-docs.err" || {
+      fail "github workstream membership filter should succeed; stderr was: $(<"$tmp/list-docs.err")"
+      return 1
+    }
+  assert_contains '"title": "GitHub parent"' "$tmp/list-docs.out" "workstream filter matches any membership" || return 1
+  if grep -Fq '"title": "GitHub child"' "$tmp/list-docs.out"; then
+    fail "workstream filter must exclude issues without that membership"
+    return 1
+  fi
+
+  BACKLOG_CONFIG="$tmp/config/backlog.json" TEST_GITHUB_TOKEN=test \
     "$ROOT/tools/backlog" list-items --q GitHub > "$tmp/search.out" 2> "$tmp/search.err" || {
       fail "github search list-items should succeed; stderr was: $(<"$tmp/search.err")"
       return 1
@@ -1235,6 +1283,7 @@ test_backlog_github_list_summarize_and_blocks() {
       return 1
     }
   assert_contains '"workstream": "tooling"' "$tmp/summary.out" "summarize workstream" || return 1
+  assert_contains '"workstream": "docs"' "$tmp/summary.out" "summarize counts secondary workstream membership" || return 1
 
   BACKLOG_CONFIG="$tmp/config/backlog.json" TEST_GITHUB_TOKEN=test \
     "$ROOT/tools/backlog" get-item --id gourmetpro--gtm-claude-code--1 > "$tmp/get.out" 2> "$tmp/get.err" || {
@@ -1262,7 +1311,7 @@ test_backlog_documents_cli_for_agents() {
   assert_contains "Purpose:" "$tmp/help.out" "help explains purpose" || return 1
   assert_contains "Use this CLI when an AI or human needs to inspect or update the shared GourmetPro backlog" "$tmp/help.out" "help explains when to use backlog" || return 1
   assert_contains "Commands:" "$tmp/help.out" "help lists commands" || return 1
-  assert_contains "create-item --repo <org/repo> --workstream <name> --title <text> --type engineering|spec_pending_impl|wiki_ops" "$tmp/help.out" "help documents create-item" || return 1
+  assert_contains "create-item --repo <org/repo> --workstream <name[,name...]> --title <text> --type engineering|spec_pending_impl|wiki_ops" "$tmp/help.out" "help documents multi-workstream create-item" || return 1
   assert_contains "AI workflow:" "$tmp/help.out" "help includes AI workflow" || return 1
   assert_contains "links JSON:" "$tmp/help.out" "help documents links JSON" || return 1
 
@@ -1289,9 +1338,10 @@ test_backlog_documents_cli_for_agents() {
   assert_contains "Includes a blocks array" "$tmp/get-item.help.out" "get-item help explains blocks" || return 1
   assert_contains "Usage: backlog summarize [--workstream <name>] [--repo <org/repo>]" "$tmp/summarize.help.out" "summarize help usage" || return 1
   assert_contains "Counts backlog items by workstream and status" "$tmp/summarize.help.out" "summarize help purpose" || return 1
-  assert_contains "Usage: backlog create-item --repo <org/repo> --workstream <name> --title <text> --type engineering|spec_pending_impl|wiki_ops" "$tmp/create-item.help.out" "create-item help usage" || return 1
+  assert_contains "Usage: backlog create-item --repo <org/repo> --workstream <name[,name...]> --title <text> --type engineering|spec_pending_impl|wiki_ops" "$tmp/create-item.help.out" "create-item help usage" || return 1
   assert_contains "--source-context <text>" "$tmp/create-item.help.out" "create-item help documents source context" || return 1
-  assert_contains "Usage: backlog update-item --id <item-id> [--status queued|in_progress|blocked|done|abandoned]" "$tmp/update-item.help.out" "update-item help usage" || return 1
+  assert_contains "Usage: backlog update-item --id <item-id> [--workstream <name[,name...]>] [--status queued|in_progress|blocked|done|abandoned]" "$tmp/update-item.help.out" "update-item help usage" || return 1
+  assert_contains "Replace workstream memberships" "$tmp/update-item.help.out" "update-item help documents workstream replacement" || return 1
   assert_contains "status=blocked requires --blocked-reason" "$tmp/update-item.help.out" "update-item help documents blocked reason" || return 1
   assert_contains "Usage: backlog add-comment --id <item-id> --body <text>" "$tmp/add-comment.help.out" "add-comment help usage" || return 1
   assert_contains "--dedupe-key <key>" "$tmp/add-comment.help.out" "add-comment help documents retry dedupe" || return 1
