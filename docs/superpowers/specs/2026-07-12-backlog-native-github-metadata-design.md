@@ -23,7 +23,7 @@ only useful prose and related links.
 
 | Backlog value | GitHub storage |
 | --- | --- |
-| `status` | `Status` single-select plus open/closed issue state |
+| `status` | `Backlog status` single-select plus open/closed issue state (`Status` is reserved by GitHub) |
 | `priority` | `Priority` single-select (`p0`→Urgent, `p1`→High, `p2`→Medium, `p3`→Low) |
 | `type` | Native issue type |
 | `workstream` | `Workstream` text field |
