@@ -91,6 +91,35 @@ supported as explicit name/ID overrides. Set `features.issueFieldsMode` to
 Legacy frontmatter remains readable and is migrated to the clean body format on
 the next `backlog update-item`.
 
+### Issue comments
+
+GitHub issue fields hold the current backlog state, while issue comments provide
+append-only collaboration history. Add or inspect comments with:
+
+```sh
+backlog add-comment --id gourmetpro--gourmetpro-website--113 \
+  --kind progress \
+  --body "Received the first batch of team headshots"
+backlog add-comment --id gourmetpro--gourmetpro-website--113 \
+  --kind decision \
+  --dedupe-key decision:about-grid \
+  --body "Keep the existing expert-card visual grammar"
+backlog list-comments --id gourmetpro--gourmetpro-website--113
+```
+
+Kinds are `note`, `progress`, `decision`, `blocker`, and `handoff`. Managed
+comments are normal readable GitHub comments with an invisible marker for their
+kind and optional dedupe key. `list-comments` also returns ordinary comments
+left directly by humans or other agents. Reusing a dedupe key returns the
+existing comment, which makes retries safe.
+
+On the GitHub backend, a new non-empty progress note posts a progress comment;
+changing it posts another, while clearing or resubmitting the same note does
+not. Transitioning an item to blocked posts the blocked reason. The Progress
+note, Status, and Blocked reason fields remain canonical and searchable.
+Comments trigger normal GitHub notifications. Comment commands are not
+supported by the compatibility Postgres backend.
+
 List configured backend names without printing secrets:
 
 ```sh

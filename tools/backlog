@@ -5,6 +5,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { spawnSync } = require('child_process');
 
 const CONSOLE_BASE_URL = 'https://gtm.gourmetpro.co';
@@ -1199,6 +1200,93 @@ async function syncGithubBlockedBy(backend, owner, repo, issueNumber, dependsOn)
   }
 }
 
+const GITHUB_COMMENT_KINDS = ['note', 'progress', 'decision', 'blocker', 'handoff'];
+const GITHUB_COMMENT_HEADINGS = {
+  note: 'Note',
+  progress: 'Progress update',
+  decision: 'Decision',
+  blocker: 'Blocked',
+  handoff: 'Handoff',
+};
+const BACKLOG_COMMENT_RE = /(?:\n\n)?<!-- backlog-comment:v1 (\{[^\n]*\}) -->\s*$/;
+const DEDUPE_KEY_RE = /^[A-Za-z0-9._:-]{1,128}$/;
+
+function formatBacklogComment(body, kind, dedupeKey = null) {
+  const meta = { kind, ...(dedupeKey ? { dedupe_key: dedupeKey } : {}) };
+  return `### ${GITHUB_COMMENT_HEADINGS[kind]}\n\n${body.trim()}\n\n<!-- backlog-comment:v1 ${JSON.stringify(meta)} -->`;
+}
+
+function parseBacklogComment(body) {
+  const text = String(body || '');
+  const match = text.match(BACKLOG_COMMENT_RE);
+  if (!match) return { body: text, managed: false, kind: null, dedupe_key: null };
+  let meta;
+  try { meta = JSON.parse(match[1]); } catch { return { body: text, managed: false, kind: null, dedupe_key: null }; }
+  if (!GITHUB_COMMENT_KINDS.includes(meta.kind)) {
+    return { body: text, managed: false, kind: null, dedupe_key: null };
+  }
+  let cleanBody = text.slice(0, match.index).trim();
+  const heading = `### ${GITHUB_COMMENT_HEADINGS[meta.kind]}`;
+  if (cleanBody === heading) cleanBody = '';
+  else if (cleanBody.startsWith(`${heading}\n\n`)) cleanBody = cleanBody.slice(heading.length + 2);
+  return {
+    body: cleanBody,
+    managed: true,
+    kind: meta.kind,
+    dedupe_key: typeof meta.dedupe_key === 'string' ? meta.dedupe_key : null,
+  };
+}
+
+function githubCommentToBacklogComment(comment) {
+  const parsed = parseBacklogComment(comment.body);
+  return {
+    id: Number(comment.id),
+    author: comment.user?.login || null,
+    body: parsed.body,
+    managed: parsed.managed,
+    kind: parsed.kind,
+    dedupe_key: parsed.dedupe_key,
+    created_at: comment.created_at,
+    updated_at: comment.updated_at,
+    html_url: comment.html_url,
+  };
+}
+
+async function getGithubBacklogIssue(backend, parsed) {
+  const issue = (await githubRequest(backend, 'GET', `/repos/${parsed.owner}/${parsed.repo}/issues/${parsed.issueNumber}`)).json;
+  if (issue.pull_request) die(`not_backlog_item: ${parsed.repoSlug}#${parsed.issueNumber} is a pull request`);
+  if (!issue.labels?.some((label) => labelName(label) === 'backlog')) {
+    die(`not_backlog_item: ${parsed.repoSlug}#${parsed.issueNumber}`);
+  }
+  return issue;
+}
+
+async function listGithubComments(backend, parsed) {
+  return githubPaginate(backend, `/repos/${parsed.owner}/${parsed.repo}/issues/${parsed.issueNumber}/comments`, null);
+}
+
+async function postGithubComment(backend, parsed, body, kind, dedupeKey = null) {
+  if (dedupeKey) {
+    const existing = (await listGithubComments(backend, parsed)).find((comment) => {
+      const decoded = parseBacklogComment(comment.body);
+      return decoded.managed && decoded.dedupe_key === dedupeKey;
+    });
+    if (existing) return githubCommentToBacklogComment(existing);
+  }
+  const comment = (await githubRequest(backend, 'POST', `/repos/${parsed.owner}/${parsed.repo}/issues/${parsed.issueNumber}/comments`, {
+    body: { body: formatBacklogComment(body, kind, dedupeKey) },
+  })).json;
+  return githubCommentToBacklogComment(comment);
+}
+
+function automaticCommentDedupeKey(parsed, kind, body) {
+  const digest = crypto.createHash('sha256')
+    .update(`${parsed.repoSlug}#${parsed.issueNumber}\0${kind}\0${body}`)
+    .digest('hex')
+    .slice(0, 24);
+  return `${kind}:${digest}`;
+}
+
 // --- GitHub commands ----------------------------------------------------------
 async function cmdListReposGithub(args, backend) {
   const pathName = backend.tokenType === 'app-installation' ? '/installation/repositories' : '/user/repos';
@@ -1267,6 +1355,17 @@ async function cmdCreateItemGithub(args, backend) {
     await githubPatchIssueWithTypeFallback(backend, owner, repo, issue.number, issuePatchForRow(backend, row, false, issue, true));
   }
   if (dependsOn.length) await syncGithubBlockedBy(backend, owner, repo, issue.number, dependsOn);
+  const parsedIssue = { owner: owner.toLowerCase(), repo: repo.toLowerCase(), issueNumber: issue.number, repoSlug: `${owner.toLowerCase()}/${repo.toLowerCase()}` };
+  if ((row.progress_note || '').trim()) {
+    const progressBody = row.progress_note.trim();
+    await postGithubComment(
+      backend,
+      parsedIssue,
+      progressBody,
+      'progress',
+      automaticCommentDedupeKey(parsedIssue, 'progress', progressBody),
+    );
+  }
   const currentIssue = (await githubRequest(backend, 'GET', `/repos/${owner}/${repo}/issues/${issue.number}`)).json;
   return githubIssueToBacklogItem(backend, currentIssue, args.repo, null, schema);
 }
@@ -1356,6 +1455,26 @@ async function cmdUpdateItemGithub(args, backend) {
   if (!fieldsSynced || !schema.issueTypes[next.type]) {
     patched = await githubPatchIssueWithTypeFallback(backend, parsed.owner, parsed.repo, parsed.issueNumber, issuePatchForRow(backend, next, true, patched, true));
   }
+  const progressBody = (next.progress_note || '').trim();
+  if (args['progress-note'] !== undefined && progressBody) {
+    await postGithubComment(
+      backend,
+      parsed,
+      progressBody,
+      'progress',
+      automaticCommentDedupeKey(parsed, 'progress', progressBody),
+    );
+  }
+  if (args.status === 'blocked') {
+    const blockerBody = next.blocked_reason.trim();
+    await postGithubComment(
+      backend,
+      parsed,
+      blockerBody,
+      'blocker',
+      automaticCommentDedupeKey(parsed, 'blocker', blockerBody),
+    );
+  }
   return githubIssueToBacklogItem(backend, patched, parsed.repoSlug, null, schema);
 }
 
@@ -1423,6 +1542,30 @@ async function cmdSummarizeGithub(args, backend) {
   }).sort((a, b) => a.workstream.localeCompare(b.workstream) || a.status.localeCompare(b.status));
 }
 
+async function cmdAddCommentGithub(args, backend) {
+  require_(args, ['id', 'body']);
+  args.body = args.body.trim();
+  checkLen(args, 'body', 1, 65536);
+  const kind = args.kind || 'note';
+  if (!GITHUB_COMMENT_KINDS.includes(kind)) {
+    fail(`--kind must be one of ${GITHUB_COMMENT_KINDS.join('|')}`);
+  }
+  const dedupeKey = args['dedupe-key'] ?? null;
+  if (dedupeKey !== null && !DEDUPE_KEY_RE.test(dedupeKey)) {
+    fail('--dedupe-key must be 1-128 characters from [A-Za-z0-9._:-]');
+  }
+  const parsed = parseGithubId(args.id);
+  await getGithubBacklogIssue(backend, parsed);
+  return postGithubComment(backend, parsed, args.body, kind, dedupeKey);
+}
+
+async function cmdListCommentsGithub(args, backend) {
+  require_(args, ['id']);
+  const parsed = parseGithubId(args.id);
+  await getGithubBacklogIssue(backend, parsed);
+  return (await listGithubComments(backend, parsed)).map(githubCommentToBacklogComment);
+}
+
 // --- adapters ----------------------------------------------------------------
 const postgresAdapter = {
   type: 'postgres',
@@ -1447,6 +1590,8 @@ const githubAdapter = {
     summarize: { fn: cmdSummarizeGithub, flags: ['workstream', 'repo'] },
     'create-item': { fn: cmdCreateItemGithub, flags: ['repo', 'workstream', 'title', 'type', 'body', 'priority', 'source-context', 'depends-on', 'branch', 'progress-note', 'due-date', 'links', 'id'] },
     'update-item': { fn: cmdUpdateItemGithub, flags: ['id', 'status', 'priority', 'title', 'body', 'blocked-reason', 'abandoned-reason', 'depends-on', 'branch', 'progress-note', 'due-date', 'links'] },
+    'add-comment': { fn: cmdAddCommentGithub, flags: ['id', 'body', 'kind', 'dedupe-key'] },
+    'list-comments': { fn: cmdListCommentsGithub, flags: ['id'] },
   },
 };
 
@@ -1633,6 +1778,46 @@ Examples:
   backlog update-item --id ai-tools--tooling--document-backlog-cli --status blocked --blocked-reason "Waiting for database access"
   backlog update-item --id ai-tools--tooling--document-backlog-cli --status done --progress-note "Help docs added and tests pass"
 `,
+  'add-comment': `
+Usage: backlog add-comment --id <item-id> --body <text> [--kind note|progress|decision|blocker|handoff] [--dedupe-key <key>]
+
+Purpose:
+  Adds a native GitHub issue comment so humans and agents can append context,
+  decisions, blockers, handoffs, or progress without overwriting current fields.
+  This command is supported only by github-issues backends.
+
+Flags:
+  --id <item-id>          Required GitHub backlog item ID.
+  --body <text>           Required readable comment body, max 65536 characters.
+  --kind <kind>           note, progress, decision, blocker, or handoff. Defaults to note.
+  --dedupe-key <key>      Optional retry key, 1-128 characters from [A-Za-z0-9._:-].
+
+Output:
+  Normalized JSON comment object with author, body, kind, timestamps, and URL.
+  Reusing a dedupe key returns the existing comment instead of posting again.
+
+Examples:
+  backlog add-comment --id gourmetpro--ai-tools--123 --body "Found another affected workflow"
+  backlog add-comment --id gourmetpro--ai-tools--123 --kind decision --dedupe-key decision:api-shape --body "Use the native issue field API"
+`,
+  'list-comments': `
+Usage: backlog list-comments --id <item-id>
+
+Purpose:
+  Lists the complete native GitHub issue conversation for a backlog item,
+  including ordinary human/AI comments and comments created by backlog.
+  This command is supported only by github-issues backends.
+
+Flags:
+  --id <item-id>    Required GitHub backlog item ID.
+
+Output:
+  JSON array ordered by GitHub's ascending comment ID. Managed comments expose
+  kind and dedupe_key; ordinary comments use managed=false and null metadata.
+
+Examples:
+  backlog list-comments --id gourmetpro--ai-tools--123
+`,
 };
 
 const GENERAL_HELP = `
@@ -1663,6 +1848,10 @@ Commands:
       Create a tracked backlog item.
   update-item --id <item-id> [--status queued|in_progress|blocked|done|abandoned]
       Update status, priority, metadata, dependencies, and notes.
+  add-comment --id <item-id> --body <text> [--kind <kind>]
+      Add durable context to a GitHub backlog issue conversation.
+  list-comments --id <item-id>
+      List human, AI, and backlog-managed GitHub issue comments.
 
 AI workflow:
   1. Run backlog list-repos to discover valid --repo values.
@@ -1670,6 +1859,8 @@ AI workflow:
   3. Use backlog get-item before changing an item you did not just create.
   4. Use create-item for durable follow-up work that should survive the chat.
   5. Use update-item to record progress, branches, blockers, completion, and links.
+  6. Use add-comment for append-only findings, decisions, and handoffs; use
+     list-comments before acting when recent conversation may matter.
 
 Configuration:
   Reads ~/.config/ai-tools/backlog.json by default.
@@ -1698,6 +1889,10 @@ GitHub backend notes:
   invisible HTML metadata are used when native APIs are unavailable. Legacy
   YAML frontmatter is read but replaced by the clean body format on update.
   Native synchronization preserves unrelated labels and human-managed fields.
+  GitHub comments provide append-only collaboration history. Non-empty changed
+  progress notes and transitions to blocked post categorized comments while the
+  matching issue fields remain canonical. Creating comments triggers normal
+  GitHub notifications; dedupe keys make agent retries safe.
 
 Output:
   Successful commands print pretty JSON to stdout.
