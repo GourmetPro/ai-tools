@@ -545,6 +545,7 @@ const server = http.createServer((req, res) => {
     }
     if (req.method === 'POST' && /^\/orgs\/GourmetPro\/issue-fields$/i.test(url.pathname)) {
       if (disableNativeMetadata) return send(res, 404, { message: 'issue fields unavailable' });
+      if (parsed.name === 'Status') return send(res, 422, { message: 'Status is a reserved issue field name' });
       const field = { id: nextFieldId++, ...parsed };
       issueFields.push(field);
       schemaLog.push({ kind: 'field', ...field });
@@ -828,6 +829,7 @@ test_backlog_github_repository_commands() {
   assert_contains '"path":"/orgs/GourmetPro/issue-fields"' "$tmp/headers.out" "github probes organization issue fields" || return 1
   curl -sS "http://127.0.0.1:$port/__test/schema-log" > "$tmp/schema.out"
   assert_contains '"name":"Workstream"' "$tmp/schema.out" "github provisions missing backlog issue fields" || return 1
+  assert_contains '"name":"Backlog status"' "$tmp/schema.out" "github avoids GitHub reserved Status field name" || return 1
   assert_contains '"name":"Engineering"' "$tmp/schema.out" "github provisions missing backlog issue types" || return 1
   if grep -Fq '"name":"Priority"' "$tmp/schema.out" || grep -Fq '"name":"Target date"' "$tmp/schema.out"; then
     fail "github must reuse existing Priority and Target date fields"

@@ -808,7 +808,7 @@ const DEFAULT_GITHUB_ISSUE_FIELDS = {
     ],
   },
   status: {
-    fieldName: 'Status', dataType: 'single_select',
+    fieldName: 'Backlog status', dataType: 'single_select',
     optionMap: { queued: 'Queued', in_progress: 'In progress', blocked: 'Blocked', done: 'Done', abandoned: 'Abandoned' },
     description: 'Current backlog workflow status',
     options: [

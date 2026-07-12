@@ -71,7 +71,9 @@ The default mapping is:
 
 - `priority` → `Priority` (`p0` Urgent, `p1` High, `p2` Medium, `p3` Low)
 - `due_date` → `Target date`
-- `status`, `workstream`, source/reason, branch, and progress values → matching
+- `status` → `Backlog status` (`Queued`, `In progress`, `Blocked`, `Done`, or
+  `Abandoned`); the qualified name avoids GitHub's reserved `Status` field name
+- `workstream`, source/reason, branch, and progress values → matching
   organization issue fields
 - backlog type → native `Engineering`, `Spec pending implementation`, or
   `Wiki ops` issue type
@@ -81,7 +83,7 @@ These values are directly searchable in GitHub, for example:
 
 ```text
 label:backlog field.priority:high
-label:backlog field.status:blocked
+label:backlog field."backlog status":blocked
 label:backlog field."target date":<=2026-07-31
 ```
 
@@ -116,7 +118,7 @@ existing comment, which makes retries safe.
 On the GitHub backend, a new non-empty progress note posts a progress comment;
 changing it posts another, while clearing or resubmitting the same note does
 not. Transitioning an item to blocked posts the blocked reason. The Progress
-note, Status, and Blocked reason fields remain canonical and searchable.
+note, Backlog status, and Blocked reason fields remain canonical and searchable.
 Comments trigger normal GitHub notifications. Comment commands are not
 supported by the compatibility Postgres backend.
 
