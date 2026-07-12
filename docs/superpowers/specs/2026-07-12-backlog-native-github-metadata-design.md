@@ -26,7 +26,7 @@ only useful prose and related links.
 | `status` | `Backlog status` single-select plus open/closed issue state (`Status` is reserved by GitHub) |
 | `priority` | `Priority` single-select (`p0`→Urgent, `p1`→High, `p2`→Medium, `p3`→Low) |
 | `type` | Native issue type |
-| `workstream` | `Workstream` text field |
+| `workstream` | One or more `ws:<slug>` labels; legacy `Workstream` values are migration input only |
 | `due_date` | `Target date` date field |
 | `source_context` | `Source context` text field |
 | `blocked_reason` | `Blocked reason` text field |

@@ -343,8 +343,9 @@ function parseDependsOn(raw, github = false) {
   return arr;
 }
 
-function validateItemFields(args) {
-  checkLen(args, 'workstream', 1, 64);
+function validateItemFields(args, github = false) {
+  if (github && args.workstream !== undefined) parseGithubWorkstreams(args.workstream);
+  else checkLen(args, 'workstream', 1, 64);
   checkLen(args, 'title', 1, 200);
   if (args.branch !== undefined) {
     args.branch = args.branch.trim();
@@ -720,6 +721,30 @@ const GITHUB_BACKLOG_LABELS = [
   ['backlog/type:wiki_ops', '006b75', 'Backlog type: wiki ops'],
 ].map(([name, color, description]) => ({ name, color, description }));
 
+const GITHUB_WORKSTREAM_LABEL_PREFIX = 'ws:';
+const GITHUB_WORKSTREAM_LABEL_COLOR = '0e8a16';
+
+function normalizeGithubWorkstreams(values) {
+  const source = Array.isArray(values) ? values : String(values ?? '').split(',');
+  return [...new Set(source
+    .map((value) => String(value).trim().replace(/^ws:/i, ''))
+    .map((value) => slugify(value).slice(0, 64))
+    .filter(Boolean))].sort();
+}
+
+function parseGithubWorkstreams(raw) {
+  const workstreams = normalizeGithubWorkstreams(raw);
+  if (!workstreams.length) fail('--workstream must contain at least one workstream');
+  return workstreams;
+}
+
+function githubWorkstreamsForRow(row) {
+  const workstreams = normalizeGithubWorkstreams(
+    Array.isArray(row.workstreams) && row.workstreams.length ? row.workstreams : row.workstream,
+  );
+  return workstreams.length ? workstreams : ['default'];
+}
+
 function labelName(label) {
   return typeof label === 'string' ? label : label?.name;
 }
@@ -729,9 +754,10 @@ function labelNames(issue) {
 }
 
 function githubLabelsFor(row, fallback = false) {
+  const workstreamLabels = githubWorkstreamsForRow(row).map((workstream) => `${GITHUB_WORKSTREAM_LABEL_PREFIX}${workstream}`);
   return fallback
-    ? ['backlog', `backlog/status:${row.status}`, `backlog/priority:${row.priority}`, `backlog/type:${row.type}`]
-    : ['backlog'];
+    ? ['backlog', ...workstreamLabels, `backlog/status:${row.status}`, `backlog/priority:${row.priority}`, `backlog/type:${row.type}`]
+    : ['backlog', ...workstreamLabels];
 }
 
 function splitRepoSlug(slug) {
@@ -781,6 +807,17 @@ async function ensureGithubLabels(backend, owner, repo) {
   for (const label of GITHUB_BACKLOG_LABELS) await ensureGithubLabel(backend, owner, repo, label);
 }
 
+async function ensureGithubWorkstreamLabels(backend, owner, repo, workstreams) {
+  if (backend.skipEnsureLabels) return;
+  for (const workstream of normalizeGithubWorkstreams(workstreams)) {
+    await ensureGithubLabel(backend, owner, repo, {
+      name: `${GITHUB_WORKSTREAM_LABEL_PREFIX}${workstream}`,
+      color: GITHUB_WORKSTREAM_LABEL_COLOR,
+      description: `Backlog workstream: ${workstream}`,
+    });
+  }
+}
+
 const githubCapabilityCache = new Map();
 
 function capabilityKey(backend, owner, repo, name) {
@@ -819,7 +856,7 @@ const DEFAULT_GITHUB_ISSUE_FIELDS = {
       { name: 'Abandoned', color: 'purple', priority: 5 },
     ],
   },
-  workstream: { fieldName: 'Workstream', dataType: 'text', description: 'Backlog workstream' },
+  workstream: { fieldName: 'Workstream', dataType: 'text', description: 'Legacy backlog workstream', legacyOnly: true },
   due_date: { fieldName: 'Target date', dataType: 'date', description: 'Expected completion date for this issue' },
   source_context: { fieldName: 'Source context', dataType: 'text', description: 'Where this backlog item originated' },
   blocked_reason: { fieldName: 'Blocked reason', dataType: 'text', description: 'Why this issue is blocked' },
@@ -841,6 +878,7 @@ function configuredGithubIssueFields(backend) {
   for (const [name, defaults] of Object.entries(DEFAULT_GITHUB_ISSUE_FIELDS)) {
     const override = configured[name] || {};
     merged[name] = { ...defaults, ...override, fieldName: override.fieldName || override.name || defaults.fieldName };
+    if (name === 'workstream') merged[name].legacyOnly = true;
   }
   for (const [name, field] of Object.entries(configured)) {
     if (!merged[name]) merged[name] = { ...field, fieldName: field.fieldName || field.name || name };
@@ -888,7 +926,7 @@ async function resolveGithubMetadataSchema(backend, owner, repo, provision = fal
       fields[name] = { ...desired };
       continue;
     }
-    if (!found && provision && capabilityEnabled(backend, owner, repo, 'issueFields')) {
+    if (!found && provision && !desired.legacyOnly && capabilityEnabled(backend, owner, repo, 'issueFields')) {
       try {
         found = (await githubRequest(backend, 'POST', `/orgs/${owner}/issue-fields`, {
           body: {
@@ -980,6 +1018,16 @@ async function syncGithubIssueFields(backend, owner, repo, issueNumber, fields, 
   const issue_field_values = [];
   for (const [name, value] of Object.entries(fieldValues)) {
     const field = fields[name];
+    if (field?.legacyOnly) {
+      if (clearEmpty && field.fieldId !== undefined) {
+        try {
+          await githubRequest(backend, 'DELETE', `/repos/${owner}/${repo}/issues/${issueNumber}/issue-field-values/${field.fieldId}`);
+        } catch (e) {
+          if (e.status !== 404) return false;
+        }
+      }
+      continue;
+    }
     const mappedValue = field ? normalizeGithubIssueFieldValue(field, value) : undefined;
     if (field?.fieldId !== undefined && mappedValue !== undefined) {
       issue_field_values.push({ field_id: Number(field.fieldId), value: mappedValue });
@@ -992,12 +1040,15 @@ async function syncGithubIssueFields(backend, owner, repo, issueNumber, fields, 
     }
   }
   if (!capabilityEnabled(backend, owner, repo, 'issueFields')) return false;
-  if (!issue_field_values.length) return Object.values(fields).every((field) => field.fieldId !== undefined);
+  const writableFieldsReady = () => Object.values(fields)
+    .filter((field) => !field.legacyOnly)
+    .every((field) => field.fieldId !== undefined);
+  if (!issue_field_values.length) return writableFieldsReady();
   try {
     await githubRequest(backend, 'POST', `/repos/${owner}/${repo}/issues/${issueNumber}/issue-field-values`, {
       body: { issue_field_values },
     });
-    return Object.values(fields).every((field) => field.fieldId !== undefined);
+    return writableFieldsReady();
   } catch (e) {
     markCapabilityUnavailable(backend, owner, repo, 'issueFields');
     return false;
@@ -1052,6 +1103,21 @@ function reconcileGithubType(issue, meta, backend) {
   return TYPES.includes(meta.type) ? meta.type : 'engineering';
 }
 
+function reconcileGithubWorkstreams(issue, meta, legacyFieldValue) {
+  const labelWorkstreams = normalizeGithubWorkstreams(
+    [...labelNames(issue)]
+      .filter((name) => name.startsWith(GITHUB_WORKSTREAM_LABEL_PREFIX))
+      .map((name) => name.slice(GITHUB_WORKSTREAM_LABEL_PREFIX.length)),
+  );
+  if (labelWorkstreams.length) return labelWorkstreams;
+  const legacyFieldWorkstreams = normalizeGithubWorkstreams(legacyFieldValue);
+  if (legacyFieldWorkstreams.length) return legacyFieldWorkstreams;
+  const metadataWorkstreams = normalizeGithubWorkstreams(
+    Array.isArray(meta.workstreams) && meta.workstreams.length ? meta.workstreams : meta.workstream,
+  );
+  return metadataWorkstreams.length ? metadataWorkstreams : ['default'];
+}
+
 async function githubIssueToBacklogItem(backend, issue, repoSlug, fieldValues = null, schema = null) {
   if (issue.pull_request) die(`not_backlog_item: ${repoSlug}#${issue.number} is a pull request`);
   if (!issue.labels?.some((l) => labelName(l) === 'backlog')) die(`not_backlog_item: ${repoSlug}#${issue.number}`);
@@ -1062,9 +1128,11 @@ async function githubIssueToBacklogItem(backend, issue, repoSlug, fieldValues = 
   const parsed = parseGithubBody(issue.body || '');
   const status = reconcileGithubStatus(issue, parsed.meta, fields, values);
   const field = (name) => fieldValueByConfiguredName(fields, values, name);
+  const workstreams = reconcileGithubWorkstreams(issue, parsed.meta, field('workstream'));
   return {
     id: githubIdFor(repoSlug, issue.number),
-    workstream: field('workstream') || parsed.meta.workstream || 'default',
+    workstream: workstreams[0],
+    workstreams,
     title: issue.title || '',
     body: parsed.body || '',
     status,
@@ -1087,10 +1155,12 @@ async function githubIssueToBacklogItem(backend, issue, repoSlug, fieldValues = 
 }
 
 function metadataForRow(row) {
+  const workstreams = githubWorkstreamsForRow(row);
   return {
     backlog_schema: 1,
     repo: row.repo,
-    workstream: row.workstream,
+    workstream: workstreams[0],
+    workstreams,
     status: row.status,
     priority: row.priority,
     type: row.type,
@@ -1107,7 +1177,9 @@ function metadataForRow(row) {
 
 function issuePatchForRow(backend, row, includeTitle = true, issue = null, fallbackLabels = false) {
   const unmanagedLabels = [...labelNames(issue || {})].filter((name) =>
-    name !== 'backlog' && !/^backlog\/(?:status|priority|type):/.test(name));
+    name !== 'backlog'
+      && !name.startsWith(GITHUB_WORKSTREAM_LABEL_PREFIX)
+      && !/^backlog\/(?:status|priority|type):/.test(name));
   const body = {
     body: formatGithubBody(metadataForRow(row), row.body || '', row.links),
     labels: [...new Set([...unmanagedLabels, ...githubLabelsFor(row, fallbackLabels)])],
@@ -1313,13 +1385,15 @@ async function cmdCreateItemGithub(args, backend) {
   oneOf(args, 'type', TYPES);
   oneOf(args, 'priority', PRIORITIES);
   if (args.id !== undefined) fail('--id is not supported by github-issues backends because GitHub assigns issue numbers');
-  validateItemFields(args);
+  validateItemFields(args, true);
   const [owner, repo] = splitRepoSlug(args.repo);
+  const workstreams = parseGithubWorkstreams(args.workstream);
   const links = parseLinks(args) ?? [];
   const dependsOn = args['depends-on'] !== undefined ? parseDependsOn(args['depends-on'], true) : [];
   const row = {
     repo: args.repo,
-    workstream: args.workstream,
+    workstream: workstreams[0],
+    workstreams,
     title: args.title,
     body: args.body || '',
     status: 'queued',
@@ -1335,6 +1409,7 @@ async function cmdCreateItemGithub(args, backend) {
     due_date: args['due-date'] ?? null,
   };
   await ensureGithubLabels(backend, owner, repo);
+  await ensureGithubWorkstreamLabels(backend, owner, repo, workstreams);
   const schema = await resolveGithubMetadataSchema(backend, owner, repo, true);
   const createBody = issuePatchForRow(backend, row, true, null, false);
   delete createBody.state;
@@ -1409,7 +1484,7 @@ async function cmdUpdateItemGithub(args, backend) {
   require_(args, ['id']);
   oneOf(args, 'status', STATUSES);
   oneOf(args, 'priority', PRIORITIES);
-  validateItemFields(args);
+  validateItemFields(args, true);
   const links = parseLinks(args);
   const dependsOn = args['depends-on'] !== undefined ? parseDependsOn(args['depends-on'], true) : undefined;
   if (dependsOn?.includes(args.id)) fail("self-reference: depends_on cannot contain the item's own id");
@@ -1420,8 +1495,14 @@ async function cmdUpdateItemGithub(args, backend) {
   const before = await githubIssueToBacklogItem(backend, issue, parsed.repoSlug, null, schema);
   validateBacklogWriteTransition(before, args);
 
+  const workstreams = args.workstream !== undefined
+    ? parseGithubWorkstreams(args.workstream)
+    : githubWorkstreamsForRow(before);
+
   const next = {
     ...before,
+    workstream: workstreams[0],
+    workstreams,
     title: args.title !== undefined ? args.title : before.title,
     body: args.body !== undefined ? args.body : before.body,
     status: args.status !== undefined ? args.status : before.status,
@@ -1439,6 +1520,7 @@ async function cmdUpdateItemGithub(args, backend) {
   else if (args.status !== undefined) next.abandoned_reason = null;
   else if (args['abandoned-reason'] !== undefined) next.abandoned_reason = args['abandoned-reason'];
 
+  await ensureGithubWorkstreamLabels(backend, parsed.owner, parsed.repo, workstreams);
   if (dependsOn !== undefined) await syncGithubBlockedBy(backend, parsed.owner, parsed.repo, parsed.issueNumber, dependsOn);
   let patched = await githubPatchIssueWithTypeFallback(backend, parsed.owner, parsed.repo, parsed.issueNumber, issuePatchForRow(backend, next, true, issue, false));
   const fieldsSynced = await syncGithubIssueFields(backend, parsed.owner, parsed.repo, parsed.issueNumber, schema.fields, {
@@ -1508,11 +1590,12 @@ async function cmdListItemsGithub(args, backend) {
   }
   const statusFilter = args.status ? new Set(args.status.split(',')) : null;
   if (statusFilter) for (const s of statusFilter) if (!STATUSES.includes(s)) fail(`bad status "${s}"`);
+  const workstreamFilter = args.workstream ? parseGithubWorkstreams(args.workstream) : null;
   let rows = mapped.filter((row) => {
     if (statusFilter && !statusFilter.has(row.status)) return false;
     if (args.priority && row.priority !== args.priority) return false;
     if (args.type && row.type !== args.type) return false;
-    if (args.workstream && row.workstream !== args.workstream) return false;
+    if (workstreamFilter && !workstreamFilter.some((workstream) => row.workstreams.includes(workstream))) return false;
     if (args.q && args.repo) {
       const q = args.q.toLowerCase();
       if (!`${row.title}\n${row.body}`.toLowerCase().includes(q)) return false;
@@ -1533,8 +1616,10 @@ async function cmdSummarizeGithub(args, backend) {
   const rows = await cmdListItemsGithub({ ...args, limit: 'all', offset: 0 }, backend);
   const counts = new Map();
   for (const row of rows) {
-    const key = `${row.workstream}\0${row.status}`;
-    counts.set(key, (counts.get(key) || 0) + 1);
+    for (const workstream of row.workstreams) {
+      const key = `${workstream}\0${row.status}`;
+      counts.set(key, (counts.get(key) || 0) + 1);
+    }
   }
   return [...counts.entries()].map(([key, count]) => {
     const [workstream, status] = key.split('\0');
@@ -1589,7 +1674,7 @@ const githubAdapter = {
     'get-item': { fn: cmdGetItemGithub, flags: ['id'] },
     summarize: { fn: cmdSummarizeGithub, flags: ['workstream', 'repo'] },
     'create-item': { fn: cmdCreateItemGithub, flags: ['repo', 'workstream', 'title', 'type', 'body', 'priority', 'source-context', 'depends-on', 'branch', 'progress-note', 'due-date', 'links', 'id'] },
-    'update-item': { fn: cmdUpdateItemGithub, flags: ['id', 'status', 'priority', 'title', 'body', 'blocked-reason', 'abandoned-reason', 'depends-on', 'branch', 'progress-note', 'due-date', 'links'] },
+    'update-item': { fn: cmdUpdateItemGithub, flags: ['id', 'workstream', 'status', 'priority', 'title', 'body', 'blocked-reason', 'abandoned-reason', 'depends-on', 'branch', 'progress-note', 'due-date', 'links'] },
     'add-comment': { fn: cmdAddCommentGithub, flags: ['id', 'body', 'kind', 'dedupe-key'] },
     'list-comments': { fn: cmdListCommentsGithub, flags: ['id'] },
   },
@@ -1664,7 +1749,7 @@ Purpose:
 
 Flags:
   --repo <org/repo>       Filter to one repository.
-  --workstream <name>     Filter to one workstream.
+  --workstream <name>     Filter to any issue with this workstream membership.
   --status <csv>          Comma-separated statuses: queued,in_progress,blocked,done,abandoned.
   --type <type>           engineering, spec_pending_impl, or wiki_ops.
   --priority <priority>   p0, p1, p2, or p3.
@@ -1702,7 +1787,8 @@ Examples:
 Usage: backlog summarize [--workstream <name>] [--repo <org/repo>]
 
 Purpose:
-  Counts backlog items by workstream and status.
+  Counts backlog items by workstream and status. GitHub multi-workstream issues
+  count once in each membership.
 
 Flags:
   --workstream <name>    Optional workstream filter.
@@ -1717,14 +1803,15 @@ Examples:
   backlog summarize --workstream tooling
 `,
   'create-item': `
-Usage: backlog create-item --repo <org/repo> --workstream <name> --title <text> --type engineering|spec_pending_impl|wiki_ops [--body <text>] [--priority p0|p1|p2|p3] [--source-context <text>] [--depends-on <id1,id2>] [--branch <branch>] [--progress-note <text>] [--due-date <YYYY-MM-DD>] [--links '<json array>'] [--id <item-id>]
+Usage: backlog create-item --repo <org/repo> --workstream <name[,name...]> --title <text> --type engineering|spec_pending_impl|wiki_ops [--body <text>] [--priority p0|p1|p2|p3] [--source-context <text>] [--depends-on <id1,id2>] [--branch <branch>] [--progress-note <text>] [--due-date <YYYY-MM-DD>] [--links '<json array>'] [--id <item-id>]
 
 Purpose:
   Creates a backlog item for durable work tracking.
 
 Flags:
   --repo <org/repo>           Repository slug.
-  --workstream <name>         Workstream name, max 64 chars.
+  --workstream <names>        Workstream name. GitHub accepts comma-separated names;
+                              Postgres remains singular. Each normalized name is max 64 chars.
   --title <text>              Item title, max 200 chars.
   --type <type>               engineering, spec_pending_impl, or wiki_ops.
   --body <text>               Optional detailed description.
@@ -1745,7 +1832,7 @@ Examples:
   backlog create-item --repo GourmetPro/app --workstream onboarding --title "Implement approved spec" --type spec_pending_impl --links '[{"kind":"spec","repo":"GourmetPro/app","path":"docs/spec.md"}]'
 `,
   'update-item': `
-Usage: backlog update-item --id <item-id> [--status queued|in_progress|blocked|done|abandoned] [--priority <p0|p1|p2|p3>] [--title <text>] [--body <text>] [--blocked-reason <text>] [--abandoned-reason <text>] [--depends-on <id1,id2>] [--branch <branch>] [--progress-note <text>] [--due-date <YYYY-MM-DD>] [--links '<json array>']
+Usage: backlog update-item --id <item-id> [--workstream <name[,name...]>] [--status queued|in_progress|blocked|done|abandoned] [--priority <p0|p1|p2|p3>] [--title <text>] [--body <text>] [--blocked-reason <text>] [--abandoned-reason <text>] [--depends-on <id1,id2>] [--branch <branch>] [--progress-note <text>] [--due-date <YYYY-MM-DD>] [--links '<json array>']
 
 Purpose:
   Updates an existing backlog item after work starts, changes priority, becomes
@@ -1753,6 +1840,8 @@ Purpose:
 
 Flags:
   --id <item-id>              Required backlog item ID.
+  --workstream <names>        GitHub only. Replace workstream memberships with a
+                              comma-separated set stored as ws:<slug> labels.
   --status <status>           queued, in_progress, blocked, done, or abandoned.
   --priority <priority>       p0, p1, p2, or p3.
   --title <text>              Replacement title.
@@ -1844,9 +1933,9 @@ Commands:
       Read one item and the items it blocks.
   summarize [--workstream <name>] [--repo <org/repo>]
       Count items by workstream and status.
-  create-item --repo <org/repo> --workstream <name> --title <text> --type engineering|spec_pending_impl|wiki_ops
+  create-item --repo <org/repo> --workstream <name[,name...]> --title <text> --type engineering|spec_pending_impl|wiki_ops
       Create a tracked backlog item.
-  update-item --id <item-id> [--status queued|in_progress|blocked|done|abandoned]
+  update-item --id <item-id> [--workstream <name[,name...]>] [--status queued|in_progress|blocked|done|abandoned]
       Update status, priority, metadata, dependencies, and notes.
   add-comment --id <item-id> --body <text> [--kind <kind>]
       Add durable context to a GitHub backlog issue conversation.
@@ -1885,8 +1974,9 @@ GitHub backend notes:
   dependency relationships. It discovers fields by name and provisions missing
   backlog fields/types when organization permissions allow. Existing field/type
   config is treated as an explicit override.
-  Capable repositories use only the "backlog" label. Compatibility labels and
-  invisible HTML metadata are used when native APIs are unavailable. Legacy
+  GitHub issues use the "backlog" label plus canonical ws:<slug> workstream
+  labels. Compatibility labels and invisible HTML metadata are used when native
+  APIs are unavailable. Legacy
   YAML frontmatter is read but replaced by the clean body format on update.
   Native synchronization preserves unrelated labels and human-managed fields.
   GitHub comments provide append-only collaboration history. Non-empty changed
