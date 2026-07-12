@@ -457,6 +457,7 @@ start_fake_github() {
   local script="$tmp/fake-github.js"
   cat > "$script" <<'JS'
 const http = require('http');
+const disableNativeMetadata = process.env.FAKE_GITHUB_DISABLE_NATIVE_METADATA === '1';
 const repo = {
   full_name: 'GourmetPro/gtm-claude-code',
   name: 'gtm-claude-code',
@@ -467,9 +468,26 @@ const repo = {
 const labels = new Set();
 const issues = new Map();
 const blockedBy = new Map();
+const commentsByIssue = new Map();
 const fieldLog = [];
+const schemaLog = [];
 const headerLog = [];
+const issueFields = [
+  { id: 101, name: 'Priority', data_type: 'single_select', options: [
+    { id: 1001, name: 'Urgent' }, { id: 1002, name: 'High' },
+    { id: 1003, name: 'Medium' }, { id: 1004, name: 'Low' }
+  ] },
+  { id: 104, name: 'Target date', data_type: 'date' }
+];
+const issueTypes = [
+  { id: 201, name: 'Task', is_enabled: true },
+  { id: 202, name: 'Bug', is_enabled: true },
+  { id: 203, name: 'Feature', is_enabled: true }
+];
+let nextFieldId = 105;
+let nextTypeId = 204;
 let nextNumber = 1;
+let nextCommentId = 5001;
 const now = '2026-01-02T00:00:00Z';
 
 function send(res, status, value) {
@@ -487,6 +505,9 @@ function issueJson(number) {
 }
 function allIssues() {
   return [...issues.values()];
+}
+function allComments() {
+  return [...commentsByIssue.values()].flat();
 }
 function mutateIssue(issue, patch) {
   if (patch.title !== undefined) issue.title = patch.title;
@@ -507,21 +528,38 @@ const server = http.createServer((req, res) => {
   req.on('data', (chunk) => { body += chunk; });
   req.on('end', () => {
     const parsed = body ? JSON.parse(body) : {};
-    if (url.pathname === '/user/repos' || url.pathname.includes('/issue-field-values') || url.pathname.match(/^\/orgs\/[^/]+\/issue-fields$/)) {
+    if (url.pathname === '/user/repos' || url.pathname.includes('/issue-field-values') || url.pathname.match(/^\/orgs\/[^/]+\/issue-(fields|types)$/)) {
       headerLog.push({ method: req.method, path: url.pathname, version: req.headers['x-github-api-version'], authorization: req.headers.authorization });
     }
     if (req.method === 'GET' && url.pathname === '/user/repos') return send(res, 200, [repo]);
     if (req.method === 'GET' && url.pathname === '/installation/repositories') return send(res, 200, { repositories: [repo] });
     if (req.method === 'GET' && url.pathname === '/search/issues') return send(res, 200, { items: allIssues() });
     if (req.method === 'GET' && url.pathname === '/__test/field-log') return send(res, 200, fieldLog);
+    if (req.method === 'GET' && url.pathname === '/__test/schema-log') return send(res, 200, schemaLog);
+    if (req.method === 'GET' && url.pathname === '/__test/issues') return send(res, 200, allIssues());
+    if (req.method === 'GET' && url.pathname === '/__test/comments') return send(res, 200, allComments());
     if (req.method === 'GET' && url.pathname === '/__test/headers') return send(res, 200, headerLog);
-    if (req.method === 'GET' && url.pathname === '/orgs/GourmetPro/issue-fields') {
-      return send(res, 200, [
-        { id: 101, name: 'Priority', data_type: 'single_select' },
-        { id: 102, name: 'Status', data_type: 'single_select' },
-        { id: 103, name: 'Workstream', data_type: 'text' },
-        { id: 104, name: 'Due Date', data_type: 'date' }
-      ]);
+    if (req.method === 'GET' && /^\/orgs\/GourmetPro\/issue-fields$/i.test(url.pathname)) {
+      if (disableNativeMetadata) return send(res, 404, { message: 'issue fields unavailable' });
+      return send(res, 200, issueFields);
+    }
+    if (req.method === 'POST' && /^\/orgs\/GourmetPro\/issue-fields$/i.test(url.pathname)) {
+      if (disableNativeMetadata) return send(res, 404, { message: 'issue fields unavailable' });
+      const field = { id: nextFieldId++, ...parsed };
+      issueFields.push(field);
+      schemaLog.push({ kind: 'field', ...field });
+      return send(res, 200, field);
+    }
+    if (req.method === 'GET' && /^\/orgs\/GourmetPro\/issue-types$/i.test(url.pathname)) {
+      if (disableNativeMetadata) return send(res, 404, { message: 'issue types unavailable' });
+      return send(res, 200, issueTypes);
+    }
+    if (req.method === 'POST' && /^\/orgs\/GourmetPro\/issue-types$/i.test(url.pathname)) {
+      if (disableNativeMetadata) return send(res, 404, { message: 'issue types unavailable' });
+      const type = { id: nextTypeId++, ...parsed };
+      issueTypes.push(type);
+      schemaLog.push({ kind: 'type', ...type });
+      return send(res, 200, type);
     }
     if (req.method === 'PATCH' && url.pathname.startsWith('/__test/issues/')) {
       const number = Number(url.pathname.split('/').pop());
@@ -535,12 +573,16 @@ const server = http.createServer((req, res) => {
     const rp = repoPath(url.pathname);
     if (!rp) return send(res, 404, { message: `not found: ${req.method} ${url.pathname}` });
     if (req.method === 'GET' && rp.rest === '') return send(res, 200, repo);
+    if (req.method === 'GET' && rp.rest === '/issue-types') {
+      return disableNativeMetadata ? send(res, 404, { message: 'issue types unavailable' }) : send(res, 200, issueTypes);
+    }
     if (req.method === 'POST' && rp.rest === '/labels') {
       labels.add(parsed.name);
       return send(res, labels.has(parsed.name) ? 201 : 422, parsed);
     }
     if (req.method === 'GET' && rp.rest === '/issues') return send(res, 200, allIssues());
     if (req.method === 'POST' && rp.rest === '/issues') {
+      if (disableNativeMetadata && parsed.type) return send(res, 422, { message: 'type unavailable' });
       const number = nextNumber++;
       const issue = {
         id: 1000 + number,
@@ -559,6 +601,7 @@ const server = http.createServer((req, res) => {
         closed_at: null
       };
       issues.set(number, issue);
+      commentsByIssue.set(number, []);
       return send(res, 201, issue);
     }
 
@@ -569,13 +612,45 @@ const server = http.createServer((req, res) => {
     const issue = issueJson(number);
     if (!issue) return send(res, 404, { message: 'not found' });
     if (req.method === 'GET' && suffix === '') return send(res, 200, issue);
-    if (req.method === 'PATCH' && suffix === '') return send(res, 200, mutateIssue(issue, parsed));
-    if (req.method === 'GET' && suffix === '/issue-field-values') return send(res, 200, issue.field_values);
+    if (req.method === 'PATCH' && suffix === '') {
+      if (disableNativeMetadata && parsed.type) return send(res, 422, { message: 'type unavailable' });
+      return send(res, 200, mutateIssue(issue, parsed));
+    }
+    if (req.method === 'GET' && suffix === '/comments') {
+      const rows = commentsByIssue.get(number) || [];
+      const perPage = Number(url.searchParams.get('per_page') || 30);
+      const page = Number(url.searchParams.get('page') || 1);
+      return send(res, 200, rows.slice((page - 1) * perPage, page * perPage));
+    }
+    if (req.method === 'POST' && suffix === '/comments') {
+      const id = nextCommentId++;
+      const comment = {
+        id,
+        body: parsed.body,
+        user: { login: 'agent-bot' },
+        created_at: now,
+        updated_at: now,
+        html_url: `${issue.html_url}#issuecomment-${id}`
+      };
+      commentsByIssue.get(number).push(comment);
+      return send(res, 201, comment);
+    }
+    if (req.method === 'GET' && suffix === '/issue-field-values') {
+      return disableNativeMetadata ? send(res, 404, { message: 'issue fields unavailable' }) : send(res, 200, issue.field_values);
+    }
     if (req.method === 'POST' && suffix === '/issue-field-values') {
+      if (disableNativeMetadata) return send(res, 404, { message: 'issue fields unavailable' });
       for (const value of parsed.issue_field_values || []) {
         fieldLog.push({ issue: number, ...value });
+        const field = issueFields.find((candidate) => Number(candidate.id) === Number(value.field_id));
         const idx = issue.field_values.findIndex((v) => Number(v.issue_field_id) === Number(value.field_id));
-        const next = { issue_field_id: value.field_id, issue_field_name: `field-${value.field_id}`, data_type: 'text', value: value.value };
+        const next = {
+          issue_field_id: value.field_id,
+          issue_field_name: field?.name || `field-${value.field_id}`,
+          data_type: field?.data_type || 'text',
+          value: value.value,
+          ...(field?.data_type === 'single_select' ? { single_select_option: { name: value.value } } : {})
+        };
         if (idx === -1) issue.field_values.push(next);
         else issue.field_values[idx] = { ...issue.field_values[idx], ...next };
       }
@@ -583,6 +658,8 @@ const server = http.createServer((req, res) => {
     }
     const delField = suffix.match(/^\/issue-field-values\/([0-9]+)$/);
     if (req.method === 'DELETE' && delField) {
+      if (disableNativeMetadata) return send(res, 404, { message: 'issue fields unavailable' });
+      fieldLog.push({ issue: number, deleted_field_id: Number(delField[1]) });
       issue.field_values = issue.field_values.filter((v) => Number(v.issue_field_id) !== Number(delField[1]));
       return send(res, 204, {});
     }
@@ -637,15 +714,7 @@ write_github_config() {
       "type": "github-issues",
       "tokenEnv": "TEST_GITHUB_TOKEN",
       "apiBaseUrl": "http://127.0.0.1:$port",
-      "features": {
-        "issueTypes": { "engineering": "Engineering" },
-        "issueFields": {
-          "priority": { "fieldId": 101, "dataType": "single_select", "optionMap": { "p0": "P0", "p1": "P1", "p2": "P2", "p3": "P3" } },
-          "status": { "fieldId": 102, "dataType": "single_select", "optionMap": { "queued": "Queued", "in_progress": "In progress", "blocked": "Blocked", "done": "Done", "abandoned": "Abandoned" } },
-          "workstream": { "fieldId": 103, "dataType": "text" },
-          "due_date": { "fieldId": 104, "dataType": "date" }
-        }
-      }
+      "features": { "issueDependencies": "auto" }
     }
   ]
 }
@@ -678,7 +747,7 @@ JSON
   fi
 }
 
-test_backlog_github_id_and_frontmatter_helpers() {
+test_backlog_github_id_and_body_metadata_helpers() {
   local tmp="$1"
 
   BACKLOG_TEST_HELPERS=1 "$ROOT/tools/backlog" __test-github-id \
@@ -711,9 +780,16 @@ EOF
       return 1
     }
 
-  assert_contains 'workstream: "new"' "$tmp/front.out" "frontmatter updates workstream" || return 1
-  assert_contains 'unknown_key: "preserve me"' "$tmp/front.out" "frontmatter preserves unknown keys" || return 1
+  assert_contains '<!-- backlog-metadata:v2 ' "$tmp/front.out" "body stores invisible backlog metadata" || return 1
+  assert_contains '"workstream":"new"' "$tmp/front.out" "body metadata updates workstream" || return 1
+  assert_contains '"unknown_key":"preserve me"' "$tmp/front.out" "body metadata preserves unknown keys" || return 1
+  assert_contains '## Related context' "$tmp/front.out" "body renders related links cleanly" || return 1
+  assert_contains '[example.com](https://example.com)' "$tmp/front.out" "body renders URL link" || return 1
   assert_contains 'Not frontmatter.' "$tmp/front.out" "human body preserved" || return 1
+  if [[ "$(head -n 1 "$tmp/front.out")" == '---' ]] || grep -Eq '^workstream:' "$tmp/front.out"; then
+    fail "body metadata helper must not emit visible YAML frontmatter"
+    return 1
+  fi
 
   printf '%s' "$(<"$tmp/front.out")" > "$tmp/front-once.md"
   BACKLOG_TEST_HELPERS=1 "$ROOT/tools/backlog" __test-frontmatter-roundtrip \
@@ -723,7 +799,7 @@ EOF
       fail "second frontmatter roundtrip should succeed; stderr was: $(<"$tmp/front-twice.err")"
       return 1
     }
-  assert_eq "$(<"$tmp/front.out")" "$(<"$tmp/front-twice.out")" "frontmatter roundtrip is byte-stable"
+  assert_eq "$(<"$tmp/front.out")" "$(<"$tmp/front-twice.out")" "body metadata roundtrip is byte-stable"
 }
 
 test_backlog_github_repository_commands() {
@@ -750,6 +826,13 @@ test_backlog_github_repository_commands() {
   assert_contains '"slug": "GourmetPro/gtm-claude-code"' "$tmp/create.out" "github create-repo slug" || return 1
   curl -sS "http://127.0.0.1:$port/__test/headers" > "$tmp/headers.out"
   assert_contains '"path":"/orgs/GourmetPro/issue-fields"' "$tmp/headers.out" "github probes organization issue fields" || return 1
+  curl -sS "http://127.0.0.1:$port/__test/schema-log" > "$tmp/schema.out"
+  assert_contains '"name":"Workstream"' "$tmp/schema.out" "github provisions missing backlog issue fields" || return 1
+  assert_contains '"name":"Engineering"' "$tmp/schema.out" "github provisions missing backlog issue types" || return 1
+  if grep -Fq '"name":"Priority"' "$tmp/schema.out" || grep -Fq '"name":"Target date"' "$tmp/schema.out"; then
+    fail "github must reuse existing Priority and Target date fields"
+    return 1
+  fi
   assert_contains '"version":"2026-03-10"' "$tmp/headers.out" "github issue field probe uses current API version" || return 1
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
@@ -797,6 +880,8 @@ test_backlog_github_create_get_update_item_and_fields() {
 
   BACKLOG_CONFIG="$tmp/config/backlog.json" TEST_GITHUB_TOKEN=test \
     "$ROOT/tools/backlog" create-item --repo GourmetPro/gtm-claude-code --workstream tooling --title "GitHub backend" --type engineering --priority p1 --body "Human body" \
+      --source-context "Decision brief" --progress-note "Ready" --due-date 2026-07-18 \
+      --links '[{"kind":"url","label":"Decision brief","url":"https://example.com/brief"}]' \
     > "$tmp/create.out" 2> "$tmp/create.err" || {
       fail "github create-item should succeed; stderr was: $(<"$tmp/create.err")"
       return 1
@@ -805,8 +890,21 @@ test_backlog_github_create_get_update_item_and_fields() {
   assert_contains '"id": "gourmetpro--gtm-claude-code--1"' "$tmp/create.out" "github create id" || return 1
   assert_contains '"console_url": "https://github.com/GourmetPro/gtm-claude-code/issues/1"' "$tmp/create.out" "github console_url" || return 1
   curl -sS "http://127.0.0.1:$port/__test/field-log" > "$tmp/fields.out"
-  assert_contains '"field_id":101' "$tmp/fields.out" "github priority issue field mirrored" || return 1
-  assert_contains '"field_id":103' "$tmp/fields.out" "github workstream issue field mirrored" || return 1
+  assert_contains '"field_id":101' "$tmp/fields.out" "github reuses native Priority field" || return 1
+  assert_contains '"field_id":104' "$tmp/fields.out" "github reuses native Target date field" || return 1
+  assert_contains '"value":"High"' "$tmp/fields.out" "github maps p1 to native High priority" || return 1
+  assert_contains '"value":"2026-07-18"' "$tmp/fields.out" "github mirrors due date" || return 1
+  assert_contains '"value":"tooling"' "$tmp/fields.out" "github mirrors workstream" || return 1
+  assert_contains '"value":"Decision brief"' "$tmp/fields.out" "github mirrors source context" || return 1
+  curl -sS "http://127.0.0.1:$port/__test/issues" > "$tmp/issues.out"
+  assert_contains '"type":{"name":"Engineering"}' "$tmp/issues.out" "github uses native backlog issue type" || return 1
+  assert_contains '"labels":[{"name":"backlog"}]' "$tmp/issues.out" "github keeps only backlog label when native metadata works" || return 1
+  assert_contains '"body":"Human body\n\n<!-- backlog-metadata:v2 ' "$tmp/issues.out" "github writes clean human-first issue body" || return 1
+  assert_contains '## Related context' "$tmp/issues.out" "github renders related context" || return 1
+  if grep -Fq '"body":"---' "$tmp/issues.out"; then
+    fail "github issue body must not contain visible YAML frontmatter"
+    return 1
+  fi
   curl -sS "http://127.0.0.1:$port/__test/headers" > "$tmp/headers.out"
   assert_contains '"path":"/repos/GourmetPro/gtm-claude-code/issues/1/issue-field-values"' "$tmp/headers.out" "github posts issue field values" || return 1
   assert_contains '"version":"2026-03-10"' "$tmp/headers.out" "github issue field values use current API version" || return 1
@@ -818,13 +916,67 @@ test_backlog_github_create_get_update_item_and_fields() {
     }
   assert_contains '"workstream": "tooling"' "$tmp/get.out" "github get workstream" || return 1
 
+  curl -sS "http://127.0.0.1:$port/__test/comments" > "$tmp/automatic-create-comments.out"
+  assert_contains '### Progress update' "$tmp/automatic-create-comments.out" "create progress note posts native timeline comment" || return 1
+  assert_contains 'Ready' "$tmp/automatic-create-comments.out" "create progress comment contains note" || return 1
+
   BACKLOG_CONFIG="$tmp/config/backlog.json" TEST_GITHUB_TOKEN=test \
-    "$ROOT/tools/backlog" update-item --id gourmetpro--gtm-claude-code--1 --status done --progress-note "Shipped" \
+    "$ROOT/tools/backlog" update-item --id gourmetpro--gtm-claude-code--1 --progress-note "Halfway" \
+    > "$tmp/progress.out" 2> "$tmp/progress.err" || {
+      fail "github progress update should succeed; stderr was: $(<"$tmp/progress.err")"
+      return 1
+    }
+  BACKLOG_CONFIG="$tmp/config/backlog.json" TEST_GITHUB_TOKEN=test \
+    "$ROOT/tools/backlog" update-item --id gourmetpro--gtm-claude-code--1 --progress-note "Halfway" \
+    > "$tmp/progress-again.out" 2> "$tmp/progress-again.err" || {
+      fail "github repeated progress update should succeed; stderr was: $(<"$tmp/progress-again.err")"
+      return 1
+    }
+
+  BACKLOG_CONFIG="$tmp/config/backlog.json" TEST_GITHUB_TOKEN=test \
+    "$ROOT/tools/backlog" update-item --id gourmetpro--gtm-claude-code--1 --status blocked --blocked-reason "Waiting on API" \
+    > "$tmp/blocked.out" 2> "$tmp/blocked.err" || {
+      fail "github blocked update should succeed; stderr was: $(<"$tmp/blocked.err")"
+      return 1
+    }
+  curl -sS "http://127.0.0.1:$port/__test/comments" > "$tmp/automatic-comments.out"
+  local automatic_comment_count
+  automatic_comment_count="$(node -e 'const fs=require("fs"); const rows=JSON.parse(fs.readFileSync(process.argv[1])); process.stdout.write(String(rows.length))' "$tmp/automatic-comments.out")"
+  assert_eq '3' "$automatic_comment_count" "automatic comments post once per changed progress note and blocker" || return 1
+  assert_contains '### Blocked' "$tmp/automatic-comments.out" "blocked transition posts native timeline comment" || return 1
+  assert_contains 'Waiting on API' "$tmp/automatic-comments.out" "blocker comment contains reason" || return 1
+
+  curl -sS -X PATCH "http://127.0.0.1:$port/__test/issues/1" -d '{"labels":["backlog","human-label"]}' > /dev/null
+
+  BACKLOG_CONFIG="$tmp/config/backlog.json" TEST_GITHUB_TOKEN=test \
+    "$ROOT/tools/backlog" update-item --id gourmetpro--gtm-claude-code--1 --status done --progress-note "" \
     > "$tmp/update.out" 2> "$tmp/update.err" || {
       fail "github update-item should succeed; stderr was: $(<"$tmp/update.err")"
       return 1
-    }
+  }
   assert_contains '"status": "done"' "$tmp/update.out" "github update status" || return 1
+  curl -sS "http://127.0.0.1:$port/__test/issues" > "$tmp/issues-updated.out"
+  curl -sS "http://127.0.0.1:$port/__test/field-log" > "$tmp/fields-updated.out"
+  curl -sS "http://127.0.0.1:$port/__test/headers" > "$tmp/headers-updated.out"
+  assert_contains '"name":"human-label"' "$tmp/issues-updated.out" "github update preserves human labels" || return 1
+  if grep -Fq 'backlog/status:' "$tmp/issues-updated.out" || grep -Fq 'backlog/priority:' "$tmp/issues-updated.out" || grep -Fq 'backlog/type:' "$tmp/issues-updated.out"; then
+    fail "github update must remove redundant managed metadata labels; fields were: $(<"$tmp/fields-updated.out"); headers were: $(<"$tmp/headers-updated.out"); issues were: $(<"$tmp/issues-updated.out")"
+    return 1
+  fi
+  assert_contains '"deleted_field_id":' "$tmp/fields-updated.out" "github clears nullable managed field values" || return 1
+
+  BACKLOG_CONFIG="$tmp/config/backlog.json" TEST_GITHUB_TOKEN=test \
+    "$ROOT/tools/backlog" update-item --id gourmetpro--gtm-claude-code--1 --status abandoned --abandoned-reason "No longer needed" \
+    > "$tmp/abandoned.out" 2> "$tmp/abandoned.err" || {
+      fail "github abandoned update should succeed; stderr was: $(<"$tmp/abandoned.err")"
+      return 1
+    }
+  assert_contains '"status": "abandoned"' "$tmp/abandoned.out" "closed issue honors native abandoned status field" || return 1
+  assert_contains '"abandoned_reason": "No longer needed"' "$tmp/abandoned.out" "github mirrors abandoned reason" || return 1
+  curl -sS "http://127.0.0.1:$port/__test/comments" > "$tmp/final-automatic-comments.out"
+  local final_automatic_comment_count
+  final_automatic_comment_count="$(node -e 'const fs=require("fs"); const rows=JSON.parse(fs.readFileSync(process.argv[1])); process.stdout.write(String(rows.length))' "$tmp/final-automatic-comments.out")"
+  assert_eq '3' "$final_automatic_comment_count" "clearing progress and abandoning do not add automatic comments" || return 1
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
 }
@@ -843,6 +995,136 @@ test_backlog_github_rejects_explicit_create_id() {
     return 1
   fi
   assert_contains "--id is not supported by github-issues backends" "$tmp/err" "github create id rejection" || return 1
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
+test_backlog_github_add_and_list_comments() {
+  local tmp="$1"
+  local pid port
+  start_fake_github "$tmp"
+  pid="$FAKE_GITHUB_PID"
+  port="$(cat "$tmp/fake-github.port")"
+  write_github_config "$tmp" "$port"
+
+  BACKLOG_CONFIG="$tmp/config/backlog.json" TEST_GITHUB_TOKEN=test \
+    "$ROOT/tools/backlog" create-item --repo GourmetPro/gtm-claude-code --workstream comments --title "Comment fixture" --type engineering \
+    > "$tmp/create.out" 2> "$tmp/create.err" || {
+      fail "github comment fixture create should succeed; stderr was: $(<"$tmp/create.err")"
+      return 1
+    }
+
+  curl -sS -X POST "http://127.0.0.1:$port/repos/GourmetPro/gtm-claude-code/issues/1/comments" \
+    -H 'content-type: application/json' -d '{"body":"Human observation"}' > /dev/null
+
+  BACKLOG_CONFIG="$tmp/config/backlog.json" TEST_GITHUB_TOKEN=test \
+    "$ROOT/tools/backlog" add-comment --id gourmetpro--gtm-claude-code--1 --kind decision \
+      --dedupe-key external:decision:1 --body "Use option B" \
+    > "$tmp/add.out" 2> "$tmp/add.err" || {
+      fail "github add-comment should succeed; stderr was: $(<"$tmp/add.err")"
+      return 1
+    }
+  assert_contains '"author": "agent-bot"' "$tmp/add.out" "add-comment returns author" || return 1
+  assert_contains '"body": "Use option B"' "$tmp/add.out" "add-comment returns clean body" || return 1
+  assert_contains '"managed": true' "$tmp/add.out" "add-comment marks managed comment" || return 1
+  assert_contains '"kind": "decision"' "$tmp/add.out" "add-comment returns kind" || return 1
+  assert_contains '"dedupe_key": "external:decision:1"' "$tmp/add.out" "add-comment returns dedupe key" || return 1
+
+  BACKLOG_CONFIG="$tmp/config/backlog.json" TEST_GITHUB_TOKEN=test \
+    "$ROOT/tools/backlog" add-comment --id gourmetpro--gtm-claude-code--1 --kind decision \
+      --dedupe-key external:decision:1 --body "Use option B" \
+    > "$tmp/add-again.out" 2> "$tmp/add-again.err" || {
+      fail "github duplicate add-comment should succeed; stderr was: $(<"$tmp/add-again.err")"
+      return 1
+    }
+  assert_eq "$(<"$tmp/add.out")" "$(<"$tmp/add-again.out")" "dedupe returns the existing normalized comment" || return 1
+
+  BACKLOG_CONFIG="$tmp/config/backlog.json" TEST_GITHUB_TOKEN=test \
+    "$ROOT/tools/backlog" list-comments --id gourmetpro--gtm-claude-code--1 \
+    > "$tmp/list.out" 2> "$tmp/list.err" || {
+      fail "github list-comments should succeed; stderr was: $(<"$tmp/list.err")"
+      return 1
+    }
+  assert_contains '"body": "Human observation"' "$tmp/list.out" "list-comments includes human comments" || return 1
+  assert_contains '"managed": false' "$tmp/list.out" "list-comments identifies human comments" || return 1
+  assert_contains '"body": "Use option B"' "$tmp/list.out" "list-comments includes managed comments" || return 1
+
+  curl -sS "http://127.0.0.1:$port/__test/comments" > "$tmp/comments.out"
+  local comment_count
+  comment_count="$(node -e 'const fs=require("fs"); const rows=JSON.parse(fs.readFileSync(process.argv[1])); process.stdout.write(String(rows.length))' "$tmp/comments.out")"
+  assert_eq '2' "$comment_count" "dedupe prevents duplicate native comments" || return 1
+  assert_contains '### Decision' "$tmp/comments.out" "managed native comment has readable heading" || return 1
+  assert_contains '<!-- backlog-comment:v1 ' "$tmp/comments.out" "managed native comment has invisible metadata" || return 1
+
+  if BACKLOG_CONFIG="$tmp/config/backlog.json" TEST_GITHUB_TOKEN=test \
+    "$ROOT/tools/backlog" add-comment --id gourmetpro--gtm-claude-code--1 --kind invalid --body "Bad" \
+    > "$tmp/invalid.out" 2> "$tmp/invalid.err"; then
+    fail "github add-comment should reject unknown kinds"
+    return 1
+  fi
+  assert_contains 'note|progress|decision|blocker|handoff' "$tmp/invalid.err" "add-comment kind validation" || return 1
+
+  if BACKLOG_CONFIG="$tmp/config/backlog.json" TEST_GITHUB_TOKEN=test \
+    "$ROOT/tools/backlog" add-comment --id gourmetpro--gtm-claude-code--1 --body "   " \
+    > "$tmp/blank.out" 2> "$tmp/blank.err"; then
+    fail "github add-comment should reject a blank body"
+    return 1
+  fi
+  assert_contains '--body must be at least 1 character' "$tmp/blank.err" "add-comment blank body validation" || return 1
+
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
+test_backlog_postgres_rejects_comment_commands() {
+  local tmp="$1"
+  mkdir -p "$tmp/config"
+  cat > "$tmp/config/backlog.json" <<'JSON'
+{"default":"pg","backends":[{"name":"pg","type":"postgres","databaseUrl":"postgres://example.invalid/db"}]}
+JSON
+
+  if BACKLOG_CONFIG="$tmp/config/backlog.json" "$ROOT/tools/backlog" add-comment --id item --body note \
+    > "$tmp/out" 2> "$tmp/err"; then
+    fail "postgres add-comment should be unsupported"
+    return 1
+  fi
+  assert_contains 'command add-comment is not supported by backend pg' "$tmp/err" "postgres comment command error" || return 1
+}
+
+test_backlog_github_native_metadata_fallback() {
+  local tmp="$1"
+  local pid port
+  export FAKE_GITHUB_DISABLE_NATIVE_METADATA=1
+  start_fake_github "$tmp"
+  unset FAKE_GITHUB_DISABLE_NATIVE_METADATA
+  pid="$FAKE_GITHUB_PID"
+  port="$(cat "$tmp/fake-github.port")"
+  write_github_config "$tmp" "$port"
+
+  BACKLOG_CONFIG="$tmp/config/backlog.json" TEST_GITHUB_TOKEN=test \
+    "$ROOT/tools/backlog" create-item --repo GourmetPro/gtm-claude-code --workstream fallback --title "Fallback metadata" --type wiki_ops --priority p0 --body "Readable body" \
+    > "$tmp/create.out" 2> "$tmp/create.err" || {
+      fail "github fallback create should succeed; stderr was: $(<"$tmp/create.err")"
+      return 1
+    }
+
+  curl -sS "http://127.0.0.1:$port/__test/issues" > "$tmp/issues.out"
+  assert_contains '"name":"backlog/status:queued"' "$tmp/issues.out" "fallback keeps searchable status label" || return 1
+  assert_contains '"name":"backlog/priority:p0"' "$tmp/issues.out" "fallback keeps searchable priority label" || return 1
+  assert_contains '<!-- backlog-metadata:v2 ' "$tmp/issues.out" "fallback keeps invisible lossless metadata" || return 1
+  if grep -Fq '"body":"---' "$tmp/issues.out"; then
+    fail "fallback issue body must not restore visible YAML frontmatter"
+    return 1
+  fi
+
+  BACKLOG_CONFIG="$tmp/config/backlog.json" TEST_GITHUB_TOKEN=test \
+    "$ROOT/tools/backlog" get-item --id gourmetpro--gtm-claude-code--1 > "$tmp/get.out" 2> "$tmp/get.err" || {
+      fail "github fallback get should succeed; stderr was: $(<"$tmp/get.err")"
+      return 1
+    }
+  assert_contains '"workstream": "fallback"' "$tmp/get.out" "fallback metadata round trips" || return 1
+  assert_contains '"type": "wiki_ops"' "$tmp/get.out" "fallback type round trips" || return 1
+
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
 }
@@ -982,7 +1264,7 @@ test_backlog_documents_cli_for_agents() {
   assert_contains "AI workflow:" "$tmp/help.out" "help includes AI workflow" || return 1
   assert_contains "links JSON:" "$tmp/help.out" "help documents links JSON" || return 1
 
-  local commands=(list-backends list-repos create-repo list-items get-item summarize create-item update-item)
+  local commands=(list-backends list-repos create-repo list-items get-item summarize create-item update-item add-comment list-comments)
   local command
   for command in "${commands[@]}"; do
     BACKLOG_CONFIG="$tmp/missing.conf" BACKLOG_DATABASE_URL= "$ROOT/tools/backlog" "$command" --help > "$tmp/$command.help.out" 2> "$tmp/$command.help.err" || {
@@ -1009,8 +1291,16 @@ test_backlog_documents_cli_for_agents() {
   assert_contains "--source-context <text>" "$tmp/create-item.help.out" "create-item help documents source context" || return 1
   assert_contains "Usage: backlog update-item --id <item-id> [--status queued|in_progress|blocked|done|abandoned]" "$tmp/update-item.help.out" "update-item help usage" || return 1
   assert_contains "status=blocked requires --blocked-reason" "$tmp/update-item.help.out" "update-item help documents blocked reason" || return 1
+  assert_contains "Usage: backlog add-comment --id <item-id> --body <text>" "$tmp/add-comment.help.out" "add-comment help usage" || return 1
+  assert_contains "--dedupe-key <key>" "$tmp/add-comment.help.out" "add-comment help documents retry dedupe" || return 1
+  assert_contains "Usage: backlog list-comments --id <item-id>" "$tmp/list-comments.help.out" "list-comments help usage" || return 1
   assert_contains "BACKLOG_BACKEND" "$tmp/help.out" "help documents backend override" || return 1
   assert_contains "github-issues" "$tmp/help.out" "help documents github backend" || return 1
+  assert_contains "discovers fields by name" "$tmp/help.out" "help documents automatic native field discovery" || return 1
+  assert_contains "YAML frontmatter is read but replaced" "$tmp/help.out" "help documents legacy body migration" || return 1
+  assert_contains "preserves unrelated labels" "$tmp/help.out" "help documents human metadata preservation" || return 1
+  assert_contains "GitHub comments provide append-only collaboration history" "$tmp/help.out" "help documents comment history" || return 1
+  assert_contains "dedupe keys make agent retries safe" "$tmp/help.out" "help documents automatic comment dedupe" || return 1
 
   BACKLOG_CONFIG="$tmp/missing.conf" BACKLOG_DATABASE_URL= "$ROOT/tools/backlog" help update-item > "$tmp/help-command.out" 2> "$tmp/help-command.err" || {
     fail "backlog help update-item should succeed without database config; stderr was: $(<"$tmp/help-command.err")"
@@ -1460,11 +1750,14 @@ run_test "backlog backend flag can appear after command" with_tmpdir test_backlo
 run_test "backlog database URL env overrides JSON postgres URL" with_tmpdir test_backlog_database_url_env_overrides_postgres_backend_url
 run_test "backlog lists configured backends without secrets" with_tmpdir test_backlog_list_backends_redacts_configured_secrets
 run_test "backlog github create-repo validation is adapter-owned" with_tmpdir test_backlog_github_create_repo_does_not_require_postgres_alias_flags
-run_test "backlog github id and frontmatter helpers" with_tmpdir test_backlog_github_id_and_frontmatter_helpers
+run_test "backlog github id and body metadata helpers" with_tmpdir test_backlog_github_id_and_body_metadata_helpers
 run_test "backlog github repository commands" with_tmpdir test_backlog_github_repository_commands
 run_test "backlog github supports literal token config" with_tmpdir test_backlog_github_literal_token_config
 run_test "backlog github create get update item and issue fields" with_tmpdir test_backlog_github_create_get_update_item_and_fields
 run_test "backlog github rejects explicit create id" with_tmpdir test_backlog_github_rejects_explicit_create_id
+run_test "backlog github adds and lists comments" with_tmpdir test_backlog_github_add_and_list_comments
+run_test "backlog postgres rejects comment commands" with_tmpdir test_backlog_postgres_rejects_comment_commands
+run_test "backlog github falls back without native metadata APIs" with_tmpdir test_backlog_github_native_metadata_fallback
 run_test "backlog github read tolerates status drift" with_tmpdir test_backlog_github_read_tolerates_human_edited_status_drift
 run_test "backlog github ignores pull requests" with_tmpdir test_backlog_github_ignores_pull_requests
 run_test "backlog github list summarize and blocks" with_tmpdir test_backlog_github_list_summarize_and_blocks

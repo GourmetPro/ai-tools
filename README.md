@@ -50,12 +50,75 @@ Choose a backend for one command with `backlog --backend github ...`, or set
 `BACKLOG_BACKEND` for automation. Old `~/.config/ai-tools/backlog.conf` files
 and `BACKLOG_DATABASE_URL` remain supported for Postgres compatibility.
 
-The GitHub backend stores backlog metadata in issue labels, issue body
-frontmatter, native issue dependencies, issue types, and configured issue fields
-when available. Configure `GITHUB_TOKEN` with repository issue write access, or
-put a `"token": "..."` value directly in your private `backlog.json` so the
-backend does not need a token environment variable. Keep that file mode `0600`
-and do not commit it.
+The GitHub backend stores backlog metadata in native issue fields, issue types,
+open/closed state, and dependency relationships. It automatically reuses the
+organization's `Priority` and `Target date` fields and provisions the remaining
+backlog fields and types when the token has organization administration access.
+Issues use only the `backlog` label when native metadata is available. Related
+links render as normal Markdown; lossless fallback metadata lives in an
+invisible HTML comment instead of visible YAML frontmatter.
+
+Native schema setup requires organization `Issue Fields` and `Issue Types`
+write permission (or `admin:org` for a classic PAT). Setting values requires
+repository push access. Tokens without the organization permissions still work:
+the backend falls back to managed status/priority/type labels and invisible
+metadata. Configure `GITHUB_TOKEN` with repository issue write access, or put a
+`"token": "..."` value directly in your private `backlog.json` so the backend
+does not need a token environment variable. Keep that file mode `0600` and do
+not commit it.
+
+The default mapping is:
+
+- `priority` → `Priority` (`p0` Urgent, `p1` High, `p2` Medium, `p3` Low)
+- `due_date` → `Target date`
+- `status`, `workstream`, source/reason, branch, and progress values → matching
+  organization issue fields
+- backlog type → native `Engineering`, `Spec pending implementation`, or
+  `Wiki ops` issue type
+- `depends_on` → native blocked-by relationships
+
+These values are directly searchable in GitHub, for example:
+
+```text
+label:backlog field.priority:high
+label:backlog field.status:blocked
+label:backlog field."target date":<=2026-07-31
+```
+
+Existing `features.issueFields` and `features.issueTypes` mappings remain
+supported as explicit name/ID overrides. Set `features.issueFieldsMode` to
+`"off"` to disable issue-field discovery and use compatibility storage only.
+Legacy frontmatter remains readable and is migrated to the clean body format on
+the next `backlog update-item`.
+
+### Issue comments
+
+GitHub issue fields hold the current backlog state, while issue comments provide
+append-only collaboration history. Add or inspect comments with:
+
+```sh
+backlog add-comment --id gourmetpro--gourmetpro-website--113 \
+  --kind progress \
+  --body "Received the first batch of team headshots"
+backlog add-comment --id gourmetpro--gourmetpro-website--113 \
+  --kind decision \
+  --dedupe-key decision:about-grid \
+  --body "Keep the existing expert-card visual grammar"
+backlog list-comments --id gourmetpro--gourmetpro-website--113
+```
+
+Kinds are `note`, `progress`, `decision`, `blocker`, and `handoff`. Managed
+comments are normal readable GitHub comments with an invisible marker for their
+kind and optional dedupe key. `list-comments` also returns ordinary comments
+left directly by humans or other agents. Reusing a dedupe key returns the
+existing comment, which makes retries safe.
+
+On the GitHub backend, a new non-empty progress note posts a progress comment;
+changing it posts another, while clearing or resubmitting the same note does
+not. Transitioning an item to blocked posts the blocked reason. The Progress
+note, Status, and Blocked reason fields remain canonical and searchable.
+Comments trigger normal GitHub notifications. Comment commands are not
+supported by the compatibility Postgres backend.
 
 List configured backend names without printing secrets:
 
