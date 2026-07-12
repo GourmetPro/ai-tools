@@ -4,7 +4,7 @@
 
 **Goal:** Replace visible backlog frontmatter and redundant labels with GitHub-native issue fields, types, state, and relationships while retaining lossless fallback behavior.
 
-**Architecture:** Extend the existing GitHub adapter with organization schema discovery/provisioning and a resolved capability map. Build issue patches from that map, synchronize each managed field without replacing unrelated values, and use an invisible body payload only for unsupported metadata and structured links.
+**Architecture:** Extend the existing GitHub adapter with organization schema discovery/provisioning and a resolved capability map. Build issue patches from that map, synchronize each managed field without replacing unrelated values, and retain a full invisible fallback payload for lossless compatibility plus clean rendered links.
 
 **Tech Stack:** Node.js 18+, GitHub REST API 2026-03-10, Bash integration tests with the existing fake GitHub server.
 

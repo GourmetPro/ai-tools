@@ -592,13 +592,56 @@ function parseFrontmatter(body) {
   return { meta, body: humanBody, rawKeys };
 }
 
-function formatFrontmatter(meta, body) {
-  const lines = ['---'];
-  for (const key of Object.keys(meta)) lines.push(`${key}: ${JSON.stringify(meta[key])}`);
-  lines.push('---');
-  if (body) lines.push('', body.replace(/^\n/, ''));
-  else lines.push('');
-  return lines.join('\n');
+const BACKLOG_METADATA_RE = /(?:^|\n)<!-- backlog-metadata:v2 (\{[^\n]*\}) -->(?:\n|$)/;
+const BACKLOG_LINKS_RE = /(?:^|\n)<!-- backlog-links:start -->\n[\s\S]*?\n<!-- backlog-links:end -->(?:\n|$)/g;
+
+function parseGithubBody(body) {
+  const legacy = parseFrontmatter(body || '');
+  let humanBody = legacy.body;
+  let meta = { ...legacy.meta };
+  const metadataMatch = humanBody.match(BACKLOG_METADATA_RE);
+  if (metadataMatch) {
+    try {
+      meta = { ...meta, ...JSON.parse(metadataMatch[1]) };
+    } catch (e) {
+      fail(`invalid backlog metadata comment: ${e.message}`);
+    }
+    humanBody = humanBody.replace(metadataMatch[0], '\n');
+  }
+  humanBody = humanBody.replace(BACKLOG_LINKS_RE, '\n');
+  return { meta, body: humanBody.trim() };
+}
+
+function githubUrlForLink(link) {
+  if (link?.url) return String(link.url);
+  if (link?.repo && link?.sha) return `https://github.com/${link.repo}/commit/${link.sha}`;
+  if (link?.repo && link?.path) return `https://github.com/${link.repo}/blob/HEAD/${link.path}`;
+  return null;
+}
+
+function githubLabelForLink(link, url) {
+  if (link?.label) return String(link.label);
+  if (link?.kind === 'pr') return 'Pull request';
+  if (link?.kind === 'commit') return link.sha ? `Commit ${String(link.sha).slice(0, 7)}` : 'Commit';
+  if (link?.path) return String(link.path);
+  try { return new URL(url).hostname.replace(/^www\./, ''); } catch { return url; }
+}
+
+function formatGithubBody(meta, body, links = meta.links) {
+  const parts = [];
+  const humanBody = String(body || '').trim();
+  if (humanBody) parts.push(humanBody);
+  if (Object.keys(meta).length) parts.push(`<!-- backlog-metadata:v2 ${JSON.stringify(meta)} -->`);
+  const renderedLinks = (Array.isArray(links) ? links : []).map((link) => {
+    const url = githubUrlForLink(link);
+    if (!url) return null;
+    const label = githubLabelForLink(link, url).replace(/[\[\]]/g, '\\$&');
+    return `- [${label}](${url})`;
+  }).filter(Boolean);
+  if (renderedLinks.length) {
+    parts.push(`<!-- backlog-links:start -->\n## Related context\n\n${renderedLinks.join('\n')}\n<!-- backlog-links:end -->`);
+  }
+  return `${parts.join('\n\n')}\n`;
 }
 
 function githubToken(backend) {
@@ -684,8 +727,10 @@ function labelNames(issue) {
   return new Set((issue.labels || []).map(labelName).filter(Boolean));
 }
 
-function githubLabelsFor(row) {
-  return ['backlog', `backlog/status:${row.status}`, `backlog/priority:${row.priority}`, `backlog/type:${row.type}`];
+function githubLabelsFor(row, fallback = false) {
+  return fallback
+    ? ['backlog', `backlog/status:${row.status}`, `backlog/priority:${row.priority}`, `backlog/type:${row.type}`]
+    : ['backlog'];
 }
 
 function splitRepoSlug(slug) {
@@ -749,8 +794,148 @@ function markCapabilityUnavailable(backend, owner, repo, name) {
   githubCapabilityCache.set(capabilityKey(backend, owner, repo, name), false);
 }
 
+const DEFAULT_GITHUB_ISSUE_FIELDS = {
+  priority: {
+    fieldName: 'Priority', dataType: 'single_select',
+    optionMap: { p0: 'Urgent', p1: 'High', p2: 'Medium', p3: 'Low' },
+    description: 'Current importance level assigned to this issue',
+    options: [
+      { name: 'Urgent', color: 'pink', priority: 1 },
+      { name: 'High', color: 'red', priority: 2 },
+      { name: 'Medium', color: 'yellow', priority: 3 },
+      { name: 'Low', color: 'green', priority: 4 },
+    ],
+  },
+  status: {
+    fieldName: 'Status', dataType: 'single_select',
+    optionMap: { queued: 'Queued', in_progress: 'In progress', blocked: 'Blocked', done: 'Done', abandoned: 'Abandoned' },
+    description: 'Current backlog workflow status',
+    options: [
+      { name: 'Queued', color: 'gray', priority: 1 },
+      { name: 'In progress', color: 'blue', priority: 2 },
+      { name: 'Blocked', color: 'red', priority: 3 },
+      { name: 'Done', color: 'green', priority: 4 },
+      { name: 'Abandoned', color: 'purple', priority: 5 },
+    ],
+  },
+  workstream: { fieldName: 'Workstream', dataType: 'text', description: 'Backlog workstream' },
+  due_date: { fieldName: 'Target date', dataType: 'date', description: 'Expected completion date for this issue' },
+  source_context: { fieldName: 'Source context', dataType: 'text', description: 'Where this backlog item originated' },
+  blocked_reason: { fieldName: 'Blocked reason', dataType: 'text', description: 'Why this issue is blocked' },
+  abandoned_reason: { fieldName: 'Abandoned reason', dataType: 'text', description: 'Why this issue was abandoned' },
+  branch: { fieldName: 'Branch', dataType: 'text', description: 'Development branch associated with this backlog item' },
+  progress_note: { fieldName: 'Progress note', dataType: 'text', description: 'Current progress or recovery note' },
+};
+
+const DEFAULT_GITHUB_ISSUE_TYPES = {
+  engineering: { name: 'Engineering', description: 'Engineering implementation work', color: 'blue' },
+  spec_pending_impl: { name: 'Spec pending implementation', description: 'Approved specification awaiting implementation', color: 'purple' },
+  wiki_ops: { name: 'Wiki ops', description: 'Knowledge base and wiki operations', color: 'green' },
+};
+
 function configuredGithubIssueFields(backend) {
-  return backend.features?.issueFields || backend.features?.customFields || {};
+  if (backend.features?.issueFields === false || backend.features?.issueFieldsMode === 'off') return {};
+  const configured = backend.features?.issueFields || backend.features?.customFields || {};
+  const merged = {};
+  for (const [name, defaults] of Object.entries(DEFAULT_GITHUB_ISSUE_FIELDS)) {
+    const override = configured[name] || {};
+    merged[name] = { ...defaults, ...override, fieldName: override.fieldName || override.name || defaults.fieldName };
+  }
+  for (const [name, field] of Object.entries(configured)) {
+    if (!merged[name]) merged[name] = { ...field, fieldName: field.fieldName || field.name || name };
+  }
+  return merged;
+}
+
+function configuredGithubIssueTypes(backend) {
+  const configured = backend.features?.issueTypes || {};
+  const merged = {};
+  for (const [name, defaults] of Object.entries(DEFAULT_GITHUB_ISSUE_TYPES)) {
+    const override = configured[name];
+    merged[name] = typeof override === 'string' ? { ...defaults, name: override } : { ...defaults, ...(override || {}) };
+  }
+  return merged;
+}
+
+const githubSchemaCache = new Map();
+
+function githubSchemaKey(backend, owner) {
+  return `${backend.name || 'github'}:${owner.toLowerCase()}`;
+}
+
+async function resolveGithubMetadataSchema(backend, owner, repo, provision = false) {
+  const key = githubSchemaKey(backend, owner);
+  const cached = githubSchemaCache.get(key);
+  if (cached && (!provision || cached.provisioned)) return cached;
+
+  const desiredFields = configuredGithubIssueFields(backend);
+  const fields = {};
+  let orgFields = [];
+  if (Object.keys(desiredFields).length && capabilityEnabled(backend, owner, repo, 'issueFields')) {
+    try {
+      const { json } = await githubRequest(backend, 'GET', `/orgs/${owner}/issue-fields`);
+      orgFields = Array.isArray(json) ? json : json?.issue_fields || [];
+    } catch {
+      // Explicit field IDs can still be writable without organization schema access.
+    }
+  }
+  for (const [name, desired] of Object.entries(desiredFields)) {
+    let found = desired.fieldId !== undefined
+      ? orgFields.find((field) => Number(field.id) === Number(desired.fieldId))
+      : orgFields.find((field) => String(field.name).toLowerCase() === String(desired.fieldName).toLowerCase());
+    if (!found && desired.fieldId !== undefined) {
+      fields[name] = { ...desired };
+      continue;
+    }
+    if (!found && provision && capabilityEnabled(backend, owner, repo, 'issueFields')) {
+      try {
+        found = (await githubRequest(backend, 'POST', `/orgs/${owner}/issue-fields`, {
+          body: {
+            name: desired.fieldName,
+            description: desired.description || null,
+            data_type: desired.dataType || 'text',
+            ...(desired.options ? { options: desired.options } : {}),
+          },
+        })).json;
+        orgFields.push(found);
+      } catch {
+        // Organization schema administration is optional; issue writes fall back.
+      }
+    }
+    fields[name] = found
+      ? { ...desired, fieldId: Number(found.id), dataType: found.data_type || desired.dataType }
+      : { ...desired };
+  }
+
+  const desiredTypes = configuredGithubIssueTypes(backend);
+  const issueTypes = {};
+  let orgTypes = [];
+  if (capabilityEnabled(backend, owner, repo, 'issueTypes')) {
+    try {
+      const { json } = await githubRequest(backend, 'GET', `/orgs/${owner}/issue-types`);
+      orgTypes = Array.isArray(json) ? json : [];
+    } catch {
+      // Configured type names can still be accepted without organization schema access.
+    }
+  }
+  for (const [name, desired] of Object.entries(desiredTypes)) {
+    let found = orgTypes.find((type) => String(type.name).toLowerCase() === String(desired.name).toLowerCase() && type.is_enabled !== false);
+    if (!found && provision && capabilityEnabled(backend, owner, repo, 'issueTypes')) {
+      try {
+        found = (await githubRequest(backend, 'POST', `/orgs/${owner}/issue-types`, {
+          body: { name: desired.name, description: desired.description || null, is_enabled: true, color: desired.color || null },
+        })).json;
+        orgTypes.push(found);
+      } catch {
+        // Organization schema administration is optional; issue writes fall back.
+      }
+    }
+    if (found) issueTypes[name] = { ...desired, id: found.id, name: found.name };
+  }
+
+  const resolved = { fields, issueTypes, provisioned: provision || cached?.provisioned || false };
+  githubSchemaCache.set(key, resolved);
+  return resolved;
 }
 
 function normalizeGithubIssueFieldValue(field, value) {
@@ -778,8 +963,8 @@ function decodeGithubIssueFieldValue(field, fieldValue) {
   return value;
 }
 
-async function getGithubIssueFieldValues(backend, owner, repo, issueNumber) {
-  if (!Object.keys(configuredGithubIssueFields(backend)).length) return [];
+async function getGithubIssueFieldValues(backend, owner, repo, issueNumber, fields) {
+  if (!Object.values(fields || {}).some((field) => field.fieldId !== undefined)) return [];
   if (!capabilityEnabled(backend, owner, repo, 'issueFields')) return [];
   try {
     const { json } = await githubRequest(backend, 'GET', `/repos/${owner}/${repo}/issues/${issueNumber}/issue-field-values`);
@@ -790,34 +975,28 @@ async function getGithubIssueFieldValues(backend, owner, repo, issueNumber) {
   }
 }
 
-async function probeGithubIssueFields(backend, owner, repo) {
-  if (!Object.keys(configuredGithubIssueFields(backend)).length) return false;
-  if (!capabilityEnabled(backend, owner, repo, 'issueFields')) return false;
-  try {
-    await githubRequest(backend, 'GET', `/orgs/${owner}/issue-fields`);
-    return true;
-  } catch (e) {
-    markCapabilityUnavailable(backend, owner, repo, 'issueFields');
-    return false;
-  }
-}
-
-async function tryGithubIssueFields(backend, owner, repo, issueNumber, fieldValues) {
-  const configured = configuredGithubIssueFields(backend);
+async function syncGithubIssueFields(backend, owner, repo, issueNumber, fields, fieldValues, clearEmpty = false) {
   const issue_field_values = [];
   for (const [name, value] of Object.entries(fieldValues)) {
-    const field = configured[name];
+    const field = fields[name];
     const mappedValue = field ? normalizeGithubIssueFieldValue(field, value) : undefined;
     if (field?.fieldId !== undefined && mappedValue !== undefined) {
       issue_field_values.push({ field_id: Number(field.fieldId), value: mappedValue });
+    } else if (clearEmpty && field?.fieldId !== undefined) {
+      try {
+        await githubRequest(backend, 'DELETE', `/repos/${owner}/${repo}/issues/${issueNumber}/issue-field-values/${field.fieldId}`);
+      } catch (e) {
+        if (e.status !== 404) return false;
+      }
     }
   }
-  if (!issue_field_values.length || !capabilityEnabled(backend, owner, repo, 'issueFields')) return false;
+  if (!capabilityEnabled(backend, owner, repo, 'issueFields')) return false;
+  if (!issue_field_values.length) return Object.values(fields).every((field) => field.fieldId !== undefined);
   try {
     await githubRequest(backend, 'POST', `/repos/${owner}/${repo}/issues/${issueNumber}/issue-field-values`, {
       body: { issue_field_values },
     });
-    return true;
+    return Object.values(fields).every((field) => field.fieldId !== undefined);
   } catch (e) {
     markCapabilityUnavailable(backend, owner, repo, 'issueFields');
     return false;
@@ -825,39 +1004,42 @@ async function tryGithubIssueFields(backend, owner, repo, issueNumber, fieldValu
 }
 
 function githubTypeName(backend, backlogType) {
-  return backend.features?.issueTypes?.[backlogType];
+  return configuredGithubIssueTypes(backend)[backlogType]?.name;
 }
 
 function backlogTypeFromGithubType(backend, type) {
   const name = typeof type === 'string' ? type : type?.name;
   if (!name) return undefined;
-  for (const [backlogType, githubName] of Object.entries(backend.features?.issueTypes || {})) {
-    if (githubName === name) return backlogType;
+  for (const [backlogType, githubType] of Object.entries(configuredGithubIssueTypes(backend))) {
+    if (String(githubType.name).toLowerCase() === String(name).toLowerCase()) return backlogType;
   }
   return undefined;
 }
 
-function fieldValueByConfiguredName(backend, fieldValues, name) {
-  const field = configuredGithubIssueFields(backend)[name];
+function fieldValueByConfiguredName(fields, fieldValues, name) {
+  const field = fields[name];
   if (!field?.fieldId) return undefined;
   const found = fieldValues.find((v) => Number(v.issue_field_id) === Number(field.fieldId));
   return decodeGithubIssueFieldValue(field, found);
 }
 
-function reconcileGithubStatus(issue, meta) {
+function reconcileGithubStatus(issue, meta, fields, fieldValues) {
   const labels = labelNames(issue);
+  const fieldStatus = fieldValueByConfiguredName(fields, fieldValues, 'status');
   if (issue.state === 'closed') {
+    if (fieldStatus === 'done' || fieldStatus === 'abandoned') return fieldStatus;
     return labels.has('backlog/status:abandoned') ? 'abandoned' : 'done';
   }
+  if (STATUSES.includes(fieldStatus)) return fieldStatus;
   for (const status of STATUSES) if (labels.has(`backlog/status:${status}`)) return status;
   return STATUSES.includes(meta.status) ? meta.status : 'queued';
 }
 
-function reconcileGithubPriority(issue, meta, backend, fieldValues) {
+function reconcileGithubPriority(issue, meta, fields, fieldValues) {
+  const fieldPriority = fieldValueByConfiguredName(fields, fieldValues, 'priority');
+  if (PRIORITIES.includes(fieldPriority)) return fieldPriority;
   const labels = labelNames(issue);
   for (const p of PRIORITIES) if (labels.has(`backlog/priority:${p}`)) return p;
-  const fieldPriority = fieldValueByConfiguredName(backend, fieldValues, 'priority');
-  if (PRIORITIES.includes(fieldPriority)) return fieldPriority;
   return PRIORITIES.includes(meta.priority) ? meta.priority : 'p2';
 }
 
@@ -869,35 +1051,36 @@ function reconcileGithubType(issue, meta, backend) {
   return TYPES.includes(meta.type) ? meta.type : 'engineering';
 }
 
-async function githubIssueToBacklogItem(backend, issue, repoSlug, fieldValues = null) {
+async function githubIssueToBacklogItem(backend, issue, repoSlug, fieldValues = null, schema = null) {
   if (issue.pull_request) die(`not_backlog_item: ${repoSlug}#${issue.number} is a pull request`);
   if (!issue.labels?.some((l) => labelName(l) === 'backlog')) die(`not_backlog_item: ${repoSlug}#${issue.number}`);
   const [owner, repo] = repoSlug.split('/');
-  const fields = fieldValues ?? await getGithubIssueFieldValues(backend, owner, repo, issue.number);
-  const parsed = parseFrontmatter(issue.body || '');
-  const status = reconcileGithubStatus(issue, parsed.meta);
-  const workstreamField = fieldValueByConfiguredName(backend, fields, 'workstream');
-  const dueDateField = fieldValueByConfiguredName(backend, fields, 'due_date');
+  const resolvedSchema = schema || await resolveGithubMetadataSchema(backend, owner, repo, false);
+  const fields = resolvedSchema.fields;
+  const values = fieldValues ?? await getGithubIssueFieldValues(backend, owner, repo, issue.number, fields);
+  const parsed = parseGithubBody(issue.body || '');
+  const status = reconcileGithubStatus(issue, parsed.meta, fields, values);
+  const field = (name) => fieldValueByConfiguredName(fields, values, name);
   return {
     id: githubIdFor(repoSlug, issue.number),
-    workstream: workstreamField || parsed.meta.workstream || 'default',
+    workstream: field('workstream') || parsed.meta.workstream || 'default',
     title: issue.title || '',
     body: parsed.body || '',
     status,
-    priority: reconcileGithubPriority(issue, parsed.meta, backend, fields),
+    priority: reconcileGithubPriority(issue, parsed.meta, fields, values),
     type: reconcileGithubType(issue, parsed.meta, backend),
-    blocked_reason: parsed.meta.blocked_reason ?? null,
-    abandoned_reason: parsed.meta.abandoned_reason ?? null,
+    blocked_reason: field('blocked_reason') ?? parsed.meta.blocked_reason ?? null,
+    abandoned_reason: field('abandoned_reason') ?? parsed.meta.abandoned_reason ?? null,
     links: Array.isArray(parsed.meta.links) ? parsed.meta.links : [],
-    source_context: parsed.meta.source_context ?? null,
+    source_context: field('source_context') ?? parsed.meta.source_context ?? null,
     created_at: issue.created_at,
     updated_at: issue.updated_at,
     completed_at: status === 'done' ? issue.closed_at : null,
     repo: parsed.meta.repo || repoSlug,
     depends_on: Array.isArray(parsed.meta.depends_on) ? parsed.meta.depends_on : [],
-    branch: parsed.meta.branch ?? null,
-    progress_note: parsed.meta.progress_note ?? null,
-    due_date: dueDateField || parsed.meta.due_date || null,
+    branch: field('branch') ?? parsed.meta.branch ?? null,
+    progress_note: field('progress_note') ?? parsed.meta.progress_note ?? null,
+    due_date: field('due_date') || parsed.meta.due_date || null,
     console_url: issue.html_url,
   };
 }
@@ -921,10 +1104,12 @@ function metadataForRow(row) {
   };
 }
 
-function issuePatchForRow(backend, row, includeTitle = true) {
+function issuePatchForRow(backend, row, includeTitle = true, issue = null, fallbackLabels = false) {
+  const unmanagedLabels = [...labelNames(issue || {})].filter((name) =>
+    name !== 'backlog' && !/^backlog\/(?:status|priority|type):/.test(name));
   const body = {
-    body: formatFrontmatter(metadataForRow(row), row.body || ''),
-    labels: githubLabelsFor(row),
+    body: formatGithubBody(metadataForRow(row), row.body || '', row.links),
+    labels: [...new Set([...unmanagedLabels, ...githubLabelsFor(row, fallbackLabels)])],
     state: row.status === 'done' || row.status === 'abandoned' ? 'closed' : 'open',
   };
   if (includeTitle) body.title = row.title;
@@ -1026,12 +1211,12 @@ async function cmdCreateRepoGithub(args, backend) {
   const [owner, repo] = splitRepoSlug(args.slug);
   const repoJson = (await githubRequest(backend, 'GET', `/repos/${owner}/${repo}`)).json;
   await ensureGithubLabels(backend, owner, repo);
+  const schema = await resolveGithubMetadataSchema(backend, owner, repo, true);
   const row = githubRepoRow(repoJson);
-  if (Object.keys(configuredGithubIssueFields(backend)).length) {
-    row.github_capabilities = {
-      issueFields: await probeGithubIssueFields(backend, owner, repo),
-    };
-  }
+  row.github_capabilities = {
+    issueFields: Object.values(schema.fields).some((field) => field.fieldId !== undefined),
+    issueTypes: Object.keys(schema.issueTypes).length > 0,
+  };
   return row;
 }
 
@@ -1062,18 +1247,28 @@ async function cmdCreateItemGithub(args, backend) {
     due_date: args['due-date'] ?? null,
   };
   await ensureGithubLabels(backend, owner, repo);
-  const createBody = issuePatchForRow(backend, row, true);
+  const schema = await resolveGithubMetadataSchema(backend, owner, repo, true);
+  const createBody = issuePatchForRow(backend, row, true, null, false);
   delete createBody.state;
   delete createBody.state_reason;
   const issue = await githubCreateIssueWithTypeFallback(backend, owner, repo, createBody);
-  await tryGithubIssueFields(backend, owner, repo, issue.number, {
+  const fieldsSynced = await syncGithubIssueFields(backend, owner, repo, issue.number, schema.fields, {
     priority: row.priority,
     status: row.status,
     workstream: row.workstream,
     due_date: row.due_date,
+    source_context: row.source_context,
+    blocked_reason: row.blocked_reason,
+    abandoned_reason: row.abandoned_reason,
+    branch: row.branch,
+    progress_note: row.progress_note,
   });
+  if (!fieldsSynced || !schema.issueTypes[row.type]) {
+    await githubPatchIssueWithTypeFallback(backend, owner, repo, issue.number, issuePatchForRow(backend, row, false, issue, true));
+  }
   if (dependsOn.length) await syncGithubBlockedBy(backend, owner, repo, issue.number, dependsOn);
-  return githubIssueToBacklogItem(backend, issue, args.repo, []);
+  const currentIssue = (await githubRequest(backend, 'GET', `/repos/${owner}/${repo}/issues/${issue.number}`)).json;
+  return githubIssueToBacklogItem(backend, currentIssue, args.repo, null, schema);
 }
 
 async function cmdGetItemGithub(args, backend) {
@@ -1081,6 +1276,10 @@ async function cmdGetItemGithub(args, backend) {
   const parsed = parseGithubId(args.id);
   const issue = (await githubRequest(backend, 'GET', `/repos/${parsed.owner}/${parsed.repo}/issues/${parsed.issueNumber}`)).json;
   const row = await githubIssueToBacklogItem(backend, issue, parsed.repoSlug);
+  const nativeBlockedBy = await getGithubBlockedBy(backend, parsed.owner, parsed.repo, parsed.issueNumber);
+  if (nativeBlockedBy !== null) {
+    row.depends_on = nativeBlockedBy.map((dependency) => githubIdFor(repoSlugFromIssue(dependency, parsed.repoSlug), dependency.number));
+  }
   const nativeBlocks = await getGithubBlocking(backend, parsed.owner, parsed.repo, parsed.issueNumber);
   let blocks = [];
   if (nativeBlocks !== null) {
@@ -1118,7 +1317,8 @@ async function cmdUpdateItemGithub(args, backend) {
 
   const parsed = parseGithubId(args.id);
   const issue = (await githubRequest(backend, 'GET', `/repos/${parsed.owner}/${parsed.repo}/issues/${parsed.issueNumber}`)).json;
-  const before = await githubIssueToBacklogItem(backend, issue, parsed.repoSlug);
+  const schema = await resolveGithubMetadataSchema(backend, parsed.owner, parsed.repo, true);
+  const before = await githubIssueToBacklogItem(backend, issue, parsed.repoSlug, null, schema);
   validateBacklogWriteTransition(before, args);
 
   const next = {
@@ -1141,14 +1341,22 @@ async function cmdUpdateItemGithub(args, backend) {
   else if (args['abandoned-reason'] !== undefined) next.abandoned_reason = args['abandoned-reason'];
 
   if (dependsOn !== undefined) await syncGithubBlockedBy(backend, parsed.owner, parsed.repo, parsed.issueNumber, dependsOn);
-  const patched = await githubPatchIssueWithTypeFallback(backend, parsed.owner, parsed.repo, parsed.issueNumber, issuePatchForRow(backend, next, true));
-  await tryGithubIssueFields(backend, parsed.owner, parsed.repo, parsed.issueNumber, {
+  let patched = await githubPatchIssueWithTypeFallback(backend, parsed.owner, parsed.repo, parsed.issueNumber, issuePatchForRow(backend, next, true, issue, false));
+  const fieldsSynced = await syncGithubIssueFields(backend, parsed.owner, parsed.repo, parsed.issueNumber, schema.fields, {
     priority: next.priority,
     status: next.status,
     workstream: next.workstream,
     due_date: next.due_date,
-  });
-  return githubIssueToBacklogItem(backend, patched, parsed.repoSlug, []);
+    source_context: next.source_context,
+    blocked_reason: next.blocked_reason,
+    abandoned_reason: next.abandoned_reason,
+    branch: next.branch,
+    progress_note: next.progress_note,
+  }, true);
+  if (!fieldsSynced || !schema.issueTypes[next.type]) {
+    patched = await githubPatchIssueWithTypeFallback(backend, parsed.owner, parsed.repo, parsed.issueNumber, issuePatchForRow(backend, next, true, patched, true));
+  }
+  return githubIssueToBacklogItem(backend, patched, parsed.repoSlug, null, schema);
 }
 
 async function cmdListItemsGithub(args, backend) {
@@ -1482,10 +1690,14 @@ Configuration:
 GitHub backend notes:
   GitHub authentication uses "token" from backlog.json when present, otherwise
   the configured tokenEnv value, defaulting to GITHUB_TOKEN.
-  GitHub stores backlog metadata in issue labels, issue body frontmatter, native
-  issue dependencies, issue types, and configured issue fields when available.
-  Issue field mirroring uses GitHub's issue-only field API and preserves
-  unrelated human-managed fields.
+  GitHub stores backlog metadata in native issue fields, issue types, state, and
+  dependency relationships. It discovers fields by name and provisions missing
+  backlog fields/types when organization permissions allow. Existing field/type
+  config is treated as an explicit override.
+  Capable repositories use only the "backlog" label. Compatibility labels and
+  invisible HTML metadata are used when native APIs are unavailable. Legacy
+  YAML frontmatter is read but replaced by the clean body format on update.
+  Native synchronization preserves unrelated labels and human-managed fields.
 
 Output:
   Successful commands print pretty JSON to stdout.
@@ -1539,10 +1751,11 @@ function maybeRunTestHelper(cmd, rest) {
   if (cmd === '__test-frontmatter-roundtrip') {
     const args = parseArgs(rest);
     require_(args, ['file', 'set']);
-    const parsed = parseFrontmatter(fs.readFileSync(args.file, 'utf8'));
+    const parsed = parseGithubBody(fs.readFileSync(args.file, 'utf8'));
     let updates;
     try { updates = JSON.parse(args.set); } catch (e) { fail(`--set is not valid JSON: ${e.message}`); }
-    process.stdout.write(formatFrontmatter({ ...parsed.meta, ...updates }, parsed.body));
+    const meta = { ...parsed.meta, ...updates };
+    process.stdout.write(formatGithubBody(meta, parsed.body, meta.links));
     return true;
   }
   return false;

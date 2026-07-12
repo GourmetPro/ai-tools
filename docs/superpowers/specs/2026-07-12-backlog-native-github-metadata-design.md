@@ -45,11 +45,13 @@ CLI must not clear or fabricate those attributes.
 Legacy YAML frontmatter remains readable. Any create or update writes the new
 body format and therefore migrates that issue away from visible YAML.
 
-The new body format stores only metadata that could not be persisted natively
-inside an HTML comment. Related links are rendered as ordinary Markdown between
-managed markers so repeated updates are byte-stable and do not duplicate the
-section. If type, field, or dependency APIs are unavailable, the comment and
-managed fallback labels preserve the complete backlog record.
+The new body format keeps a full lossless fallback record inside an HTML
+comment. Native attributes remain the read/search source of truth, while the
+comment protects round trips when a token later loses access to a capability.
+Related links are rendered as ordinary Markdown between managed markers so
+repeated updates are byte-stable and do not duplicate the section. If type,
+field, or dependency APIs are unavailable, the comment and managed fallback
+labels preserve the complete backlog record.
 
 Native values win on reads, followed by fallback labels, the invisible payload,
 and finally legacy frontmatter. Clearing a nullable backlog value deletes only
