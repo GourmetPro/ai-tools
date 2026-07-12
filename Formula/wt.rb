@@ -5,9 +5,9 @@ class Wt < Formula
   desc "Launch Claude sessions in isolated Git worktrees"
   homepage "https://github.com/GourmetPro/ai-tools"
   url "https://github.com/GourmetPro/ai-tools.git",
-      tag:      "v0.3.3",
-      revision: "43334e375feab6a10ba179436c02e105f56d7fa5"
-  version "0.3.3"
+      tag:      "v0.4.0",
+      revision: "ff8c6ec42a1849868f676cf306c95f066da260d9"
+  version "0.4.0"
   depends_on "git"
   depends_on "zsh"
 
