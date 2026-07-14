@@ -197,6 +197,12 @@ test_wt_requires_claude_for_launch_options() {
   done
 }
 
+test_wt_docs_describe_opt_in_claude() {
+  assert_contains '`wt`: create or reuse an isolated Git worktree' "$ROOT/README.md" "README describes wt preparation" || return 1
+  assert_contains 'wt feature --claude' "$ROOT/README.md" "README documents explicit Claude launch" || return 1
+  assert_contains 'Create isolated Git worktrees with optional Claude launch' "$ROOT/Formula/wt.rb" "wt formula description matches behavior" || return 1
+}
+
 test_wt_copies_env_local() {
   local tmp="$1"
   mkdir -p "$tmp/bin" "$tmp/repo"
@@ -1850,6 +1856,7 @@ run_test "wt runs as a standalone executable" test_wt_runs_as_executable
 run_test "wt prepares a worktree without launching claude" with_tmpdir test_wt_does_not_launch_claude_by_default
 run_test "wt passes model flag to claude" with_tmpdir test_wt_passes_model_to_claude
 run_test "wt requires --claude for launch options" with_tmpdir test_wt_requires_claude_for_launch_options
+run_test "wt docs describe opt-in Claude launch" test_wt_docs_describe_opt_in_claude
 run_test "wt copies .env.local into worktrees" with_tmpdir test_wt_copies_env_local
 run_test "envrun runs as a standalone executable" test_envrun_runs_as_executable
 run_test "envrun loads local env files from the Git root" with_tmpdir test_envrun_loads_local_env_files_from_git_root

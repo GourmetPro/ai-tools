@@ -2,7 +2,7 @@
 
 # Homebrew formula for the wt worktree launcher.
 class Wt < Formula
-  desc "Launch Claude sessions in isolated Git worktrees"
+  desc "Create isolated Git worktrees with optional Claude launch"
   homepage "https://github.com/GourmetPro/ai-tools"
   url "https://github.com/GourmetPro/ai-tools.git",
       tag:      "v0.5.0",
@@ -17,7 +17,8 @@ class Wt < Formula
 
   def caveats
     <<~EOS
-      wt launches the claude CLI. Install and authenticate claude separately.
+      wt --claude launches the claude CLI. Install and authenticate claude separately
+      only when using that option.
     EOS
   end
 
