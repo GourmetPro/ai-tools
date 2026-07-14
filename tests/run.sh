@@ -94,7 +94,48 @@ test_wt_runs_as_executable() {
     fail "tools/wt --help should exit 0; output was: $output"
     return 1
   }
-  assert_eq 'Usage: wt <name> [--from <branch>] [--model <model>] [--prompt "..."] [--tmux]' "$output" "wt help output"
+  assert_eq 'Usage: wt <name> [--from <branch>] [--claude [--model <model>] [--prompt "..."] [--tmux]]' "$output" "wt help output"
+}
+
+test_wt_does_not_launch_claude_by_default() {
+  local tmp="$1"
+  mkdir -p "$tmp/bin" "$tmp/repo"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'set -euo pipefail' \
+    ': > "$CLAUDE_MARKER"' > "$tmp/bin/claude"
+  chmod +x "$tmp/bin/claude"
+
+  git -C "$tmp/repo" init -q -b main || {
+    fail "temp git init failed"
+    return 1
+  }
+  git -C "$tmp/repo" config user.email "test@example.invalid"
+  git -C "$tmp/repo" config user.name "Test Runner"
+  printf 'initial\n' > "$tmp/repo/README.md"
+  git -C "$tmp/repo" add README.md
+  git -C "$tmp/repo" commit -q -m initial || {
+    fail "temp git commit failed"
+    return 1
+  }
+
+  local marker="$tmp/claude-called"
+  (
+    cd "$tmp/repo" &&
+      PATH="$tmp/bin:$PATH" CLAUDE_MARKER="$marker" "$ROOT/tools/wt" feature
+  ) > "$tmp/out" 2> "$tmp/err" || {
+    fail "wt should prepare the worktree; stderr was: $(<"$tmp/err")"
+    return 1
+  }
+
+  [[ -d "$tmp/repo/.claude/worktrees/feature" ]] || {
+    fail "wt should create the requested worktree"
+    return 1
+  }
+  [[ ! -e "$marker" ]] || {
+    fail "wt should not launch claude by default"
+    return 1
+  }
+  assert_contains '→ Worktree ready:' "$tmp/out" "wt prints the prepared path"
 }
 
 test_wt_passes_model_to_claude() {
@@ -124,9 +165,9 @@ test_wt_passes_model_to_claude() {
   (
     cd "$tmp/repo" &&
       PATH="$tmp/bin:$PATH" CLAUDE_ARGS_FILE="$args" CLAUDE_PWD_FILE="$pwd_file" \
-        "$ROOT/tools/wt" feature --model opus --prompt "do work" --tmux
+        "$ROOT/tools/wt" feature --claude --model opus --prompt "do work" --tmux
   ) > "$tmp/out" 2> "$tmp/err" || {
-    fail "wt should accept --model and launch claude; stderr was: $(<"$tmp/err")"
+    fail "wt should launch claude when requested; stderr was: $(<"$tmp/err")"
     return 1
   }
 
@@ -135,6 +176,31 @@ test_wt_passes_model_to_claude() {
   repo_physical="$(cd "$tmp/repo" && pwd -P)"
   assert_eq "$expected_args" "$(<"$args")" "claude args include model" || return 1
   assert_eq "$repo_physical/.claude/worktrees/feature" "$(<"$pwd_file")" "claude launched in worktree"
+}
+
+test_wt_requires_claude_for_launch_options() {
+  local tmp="$1"
+  local -a args
+
+  for option in model prompt tmux; do
+    case "$option" in
+      model) args=(--model opus) ;;
+      prompt) args=(--prompt work) ;;
+      tmux) args=(--tmux) ;;
+    esac
+
+    if (cd "$tmp" && "$ROOT/tools/wt" feature "${args[@]}") > "$tmp/$option.out" 2> "$tmp/$option.err"; then
+      fail "wt should reject --$option without --claude"
+      return 1
+    fi
+    assert_contains "require --claude" "$tmp/$option.err" "--$option explains the launch gate" || return 1
+  done
+}
+
+test_wt_docs_describe_opt_in_claude() {
+  assert_contains '`wt`: create or reuse an isolated Git worktree' "$ROOT/README.md" "README describes wt preparation" || return 1
+  assert_contains 'wt feature --claude' "$ROOT/README.md" "README documents explicit Claude launch" || return 1
+  assert_contains 'Create isolated Git worktrees with optional Claude launch' "$ROOT/Formula/wt.rb" "wt formula description matches behavior" || return 1
 }
 
 test_wt_copies_env_local() {
@@ -164,7 +230,7 @@ test_wt_copies_env_local() {
     cd "$tmp/repo" &&
       PATH="$tmp/bin:$PATH" "$ROOT/tools/wt" feature
   ) > "$tmp/out" 2> "$tmp/err" || {
-    fail "wt should launch claude after preparing env files; stderr was: $(<"$tmp/err")"
+    fail "wt should prepare env files; stderr was: $(<"$tmp/err")"
     return 1
   }
 
@@ -1574,7 +1640,7 @@ test_wt_installs_separately() {
     fail "installed wt --help should exit 0; output was: $output"
     return 1
   }
-  assert_eq 'Usage: wt <name> [--from <branch>] [--model <model>] [--prompt "..."] [--tmux]' "$output" "installed wt help output"
+  assert_eq 'Usage: wt <name> [--from <branch>] [--claude [--model <model>] [--prompt "..."] [--tmux]]' "$output" "installed wt help output"
 }
 
 test_envrun_installs_separately() {
@@ -1787,7 +1853,10 @@ test_bump_homebrew_release_script_bumps_semver_levels() {
 }
 
 run_test "wt runs as a standalone executable" test_wt_runs_as_executable
+run_test "wt prepares a worktree without launching claude" with_tmpdir test_wt_does_not_launch_claude_by_default
 run_test "wt passes model flag to claude" with_tmpdir test_wt_passes_model_to_claude
+run_test "wt requires --claude for launch options" with_tmpdir test_wt_requires_claude_for_launch_options
+run_test "wt docs describe opt-in Claude launch" test_wt_docs_describe_opt_in_claude
 run_test "wt copies .env.local into worktrees" with_tmpdir test_wt_copies_env_local
 run_test "envrun runs as a standalone executable" test_envrun_runs_as_executable
 run_test "envrun loads local env files from the Git root" with_tmpdir test_envrun_loads_local_env_files_from_git_root

@@ -1,10 +1,14 @@
 #!/usr/bin/env zsh
-# wt - Launch a Claude session in an isolated worktree under .claude/worktrees/<name>.
+# wt - Prepare an isolated worktree, optionally launching Claude inside it.
 #
 # Install:
 #   ./install/wt
 #
-# Usage: wt <name> [--from <branch>] [--model <model>] [--prompt "..."] [--tmux]
+# Usage: wt <name> [--from <branch>] [--claude [--model <model>] [--prompt "..."] [--tmux]]
+
+usage() {
+  print -r -- 'Usage: wt <name> [--from <branch>] [--claude [--model <model>] [--prompt "..."] [--tmux]]'
+}
 
 main() {
   emulate -L zsh
@@ -15,6 +19,8 @@ main() {
   local model=""
   local prompt=""
   local tmux=0
+  local launch_claude=0
+  local claude_option_used=0
 
   while (( $# )); do
     case "$1" in
@@ -24,18 +30,25 @@ main() {
         ;;
       --model)
         model="$2"
+        claude_option_used=1
         shift 2
         ;;
       --prompt)
         prompt="$2"
+        claude_option_used=1
         shift 2
         ;;
       --tmux)
         tmux=1
+        claude_option_used=1
+        shift
+        ;;
+      --claude)
+        launch_claude=1
         shift
         ;;
       -h|--help)
-        print -r -- "Usage: wt <name> [--from <branch>] [--model <model>] [--prompt \"...\"] [--tmux]"
+        usage
         return 0
         ;;
       -*)
@@ -55,7 +68,12 @@ main() {
   done
 
   if [[ -z "$name" ]]; then
-    print -r -- "Usage: wt <name> [--from <branch>] [--model <model>] [--prompt \"...\"] [--tmux]" >&2
+    usage >&2
+    return 1
+  fi
+
+  if (( claude_option_used && ! launch_claude )); then
+    print -r -- "wt: --model, --prompt, and --tmux require --claude" >&2
     return 1
   fi
 
@@ -119,6 +137,11 @@ main() {
   # Defensive tmp/ prep.
   mkdir -p "$wt_path/tmp"
   print -r -- "✓ tmp/ ready"
+
+  if (( ! launch_claude )); then
+    print -r -- "→ Worktree ready: $wt_path"
+    return 0
+  fi
 
   # Terminal tab title.
   print -Pn "\e]0;cc:${name}\a"

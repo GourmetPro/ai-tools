@@ -4,7 +4,7 @@ Portable command-line tools and Homebrew formulae for humans and agents.
 
 ## Tools
 
-- `wt`: launch a Claude session in an isolated Git worktree.
+- `wt`: create or reuse an isolated Git worktree, with optional Claude launch.
 - `envrun`: run a command with local `.env` / `.env.local` files exported.
 - `backlog`: query and mutate the GourmetPro backlog from Postgres or GitHub Issues.
 
@@ -170,6 +170,19 @@ Install each tool independently:
 ./install/wt
 ./install/envrun
 ./install/backlog
+```
+
+Prepare a worktree for any human or agent:
+
+```sh
+wt feature
+```
+
+Launch Claude Code in the prepared worktree when requested:
+
+```sh
+wt feature --claude
+wt feature --claude --model opus --prompt "Implement the feature" --tmux
 ```
 
 These installers symlink into `$AI_TOOLS_BIN_DIR` or `~/.local/bin` by default.
